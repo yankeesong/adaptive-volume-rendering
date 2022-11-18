@@ -16,3 +16,4 @@ tqdm
 lpips
 einops
 gdown
+h5py
