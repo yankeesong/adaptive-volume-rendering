@@ -1,5 +1,6 @@
 from skimage.transform import resize
 from torch.utils.data import IterableDataset
+import h5py
 
 def parse_rgb(hdf5_dataset):
     s = hdf5_dataset[...].tobytes()
