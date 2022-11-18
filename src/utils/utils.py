@@ -22,6 +22,7 @@ from einops import rearrange, repeat
 
 from dotmap import DotMap
 from pyhocon import ConfigFactory
+from skimage.transform import resize
 
 
 def init_weights(m):
