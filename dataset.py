@@ -1,9 +1,4 @@
-import sys
-import os
-sys.path.insert(
-    0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-)
-from utils.utils import *
+from utils import *
 
 def parse_rgb(hdf5_dataset):
     s = hdf5_dataset[...].tobytes()
