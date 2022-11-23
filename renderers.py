@@ -90,7 +90,7 @@ class VolumeRenderer(nn.Module):
             depth_map: for each pixel coordinate x_pix, the depth of the respective ray.
  
         """
-        batch_size, num_rays = x_pix.shape[0], x_pix.shape[1], x_pix.shape[2]  # _ should be 2, since each pixel coordinate has 2 inputs
+        batch_size, num_rays = x_pix.shape[0], x_pix.shape[1]  # _ should be 2, since each pixel coordinate has 2 inputs
 
         # Compute the ray directions in world coordinates.
         # Use the function get_world_rays.
@@ -102,7 +102,7 @@ class VolumeRenderer(nn.Module):
                                                 ros, rds, device=x_pix.device)
 
         # Reshape pts to (batch_size, -1, 3).
-        pts = pts.reshape(1, batch_size, -1, 3)  # To comply with pixelnerf input
+        pts = pts.reshape(1, batch_size, 3)  # To comply with pixelnerf input
 
         # Sample the radiance field with the points along the rays.
         sigma_rad = radiance_field(pts)

@@ -15,6 +15,7 @@ def fit(
     for step in range(total_steps):
         # Get the next batch of data and move it to the GPU
         model_input, ground_truth = next(data_iterator)
+
         model_input, ground_truth = to_gpu(model_input), to_gpu(ground_truth)
 
         # Compute the MLP output for the given input data and compute the loss
