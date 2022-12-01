@@ -1,10 +1,10 @@
 from utils import *
 import sys
-root_dir = "/Users/jameszli/desktop/MIT/6.S980/"  
-sys.path.insert(0, f"{root_dir}/scene-representation-networks/")
+#root_dir = "/Users/jameszli/desktop/MIT/6.S980/"  
+#sys.path.insert(0, f"{root_dir}/scene-representation-networks/")
 from geometry import *
 from util import *
-from pytorch_prototyping import pytorch_prototyping
+#from pytorch_prototyping import pytorch_prototyping
 
 def init_recurrent_weights(self):
     for m in self.modules():
@@ -158,7 +158,7 @@ class VolumeRenderer(nn.Module):
                                                 ros, rds, device=x_pix.device)
 
         # Reshape pts to (batch_size, -1, 3).
-        pts = pts.reshape(1, batch_size, 3)  # To comply with pixelnerf input
+        pts = pts.reshape( batch_size, -1,3)  # To comply with pixelnerf input
 
         # Sample the radiance field with the points along the rays.
         sigma_rad = radiance_field(pts)
@@ -312,7 +312,7 @@ class AdaptiveVolumeRenderer(nn.Module):
                                                 ros, rds, device=x_pix.device) # might not be right.
 
         # Reshape pts to (batch_size, -1, 3).
-        pts = pts.reshape(1, batch_size, 3)  # To comply with pixelnerf input
+        pts = pts.reshape(batch_size, -1,3)  # To comply with pixelnerf input
 
         # Sample the radiance field with the points along the rays.
         sigma_rad = radiance_field(pts)

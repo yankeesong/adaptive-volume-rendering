@@ -102,6 +102,8 @@ class SRNsCars(IterableDataset):
 
             model_input = {"cam2world": c2w,
                            "intrinsics": intrinsics,
+                           "focal": intrinsics[0,0],
+                           "c":torch.tensor([intrinsics[0,2], intrinsics[1,2]], dtype=torch.float32),
                            "x_pix": x_pix,
                            "idx": torch.tensor([idx])}
 

@@ -1,6 +1,7 @@
 from utils import *
 
 def fit(
+    net: nn.Module,
     model: nn.Module,
     data_iterator,
     loss_fn,
@@ -17,6 +18,22 @@ def fit(
         model_input, ground_truth = next(data_iterator)
 
         model_input, ground_truth = to_gpu(model_input), to_gpu(ground_truth)
+
+        # Encode
+        # :param images (SB, NS, 3, H, W)
+        # NS is number of input (aka source or reference) views, now can only deal with 1
+        # :param poses (SB, NS, 4, 4)
+        # :param focal focal length () or (2) or (NS) or (NS, 2) [fx, fy]
+        # :param z_bounds ignored argument (used in the past)
+        # :param c principal point None or () or (2) or (NS) or (NS, 2) [cx, cy],
+        # default is center of image
+        sl = int(np.sqrt(ground_truth.shape[1]))
+        images = ground_truth.reshape(-1,sl,sl,3).permute(0,3,1,2)
+        poses = model_input['cam2world']
+        focal = model_input['focal']
+        c = model_input['c']
+        
+        net.encode(images, poses, focal, c)
 
         # Compute the MLP output for the given input data and compute the loss
         model_output = model(model_input)
