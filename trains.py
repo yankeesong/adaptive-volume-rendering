@@ -14,10 +14,11 @@ def fit(
 
     losses = []
     for step in range(total_steps):
+        print(step)
         # Get the next batch of data and move it to the GPU
         model_input = next(data_iterator)
         model_input = to_gpu(model_input)
-        ground_truth = model_input["images"] # (NV, H*W, 3)
+        ground_truth = model_input["images"] # (NV, H*W, 3), values are between 0 and 1
 
         NV, sl2, _ = ground_truth.shape
         NS = 1 # Number of source views, san only handle one now
@@ -36,13 +37,16 @@ def fit(
         # :param c principal point None or () or (2) or (NS) or (NS, 2) [cx, cy],
         # default is center of image
         src_images = ground_truth[src_idx,...].reshape(-1,sl,sl,3).permute(0,3,1,2)
-        print(f'source image has size {src_images.shape}')
+        #print(f'source image has size {src_images.shape}')
         poses = model_input['cam2world'][src_idx,...]
-        print(f'poses has size {poses.shape}')
+        #print(f'poses has size {poses.shape}')
         focal = model_input['focal'][src_idx,...]
         c = model_input['c'][src_idx,...]
         
         net.encode(src_images, poses, focal, c)
+
+
+        
 
         # Compute the MLP output for the given input data and compute the loss
         model_output = model(model_input)

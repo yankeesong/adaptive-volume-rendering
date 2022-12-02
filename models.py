@@ -338,7 +338,7 @@ class RadFieldAndRenderer(nn.Module):
         intrinsics = model_input['intrinsics']
         c2w = model_input['cam2world']
 
-        print(f'pixels shape: {xy_pix.shape}')
+        #print(f'pixels shape: {xy_pix.shape}')
 
         rgb, depth = self.renderer(
                               c2w,

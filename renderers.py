@@ -108,7 +108,7 @@ def volume_integral(
 
 
 class VolumeRenderer(nn.Module):
-    def __init__(self, near, far, n_coarse=32, n_fine=16, n_fine_depth=8, depth_std = 0.01, white_back=True):
+    def __init__(self, near=1.0, far=2.5, n_coarse=32, n_fine=16, n_fine_depth=8, depth_std = 0.01, white_back=True):
         super().__init__()
         self.near = near
         self.far = far
@@ -171,8 +171,21 @@ class VolumeRenderer(nn.Module):
         sigma = sigma.view(NV, num_rays, self.n_coarse, 1)
         rad = rad.view(NV, num_rays, self.n_coarse, 3)
 
+        # print('pixelnerf output has colors')
+        # print(rad)
+        # print('pixelnerf output has densities')
+        # print(sigma)
+
+        # print('z values are')
+        # print(z_vals)
+
         # Compute pixel colors, depths, and weights via the volume integral.
         rgb, depth_map, weights = volume_integral(z_vals, sigma, rad)
+
+        # print('volume renderer output has colors')
+        # print(rgb)
+        # print('volume renderer output has depth')
+        # print(depth_map)
 
         if self.white_back:
             accum = weights.sum(dim=-2)
@@ -183,8 +196,10 @@ class VolumeRenderer(nn.Module):
     @classmethod
     def from_conf(cls, conf, white_back=False):
         return cls(
-            conf.get_int("n_coarse", 32),
-            conf.get_int("n_fine", 16),
+            near=conf.get_float("near", 1.0),
+            far=conf.get_float("far", 2.5),
+            n_coarse=conf.get_int("n_coarse", 32),
+            n_fine=conf.get_int("n_fine", 16),
             n_fine_depth=conf.get_int("n_fine_depth", 8),
             depth_std=conf.get_float("depth_std", 0.01),
             white_back=conf.get_float("white_back", white_back),
