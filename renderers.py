@@ -155,37 +155,123 @@ class VolumeRenderer(nn.Module):
         # Generate the points along rays and their depth values
         # Use the function sample_points_along_rays.
         pts, z_vals = sample_points_along_rays(self.near, self.far, self.n_coarse, 
-                                                ros, rds, device=x_pix.device)
+                                                ros, rds, device=x_pix.device) # pts has shape (NV, num_rays, 3)
+        # print(f'pts has shape {pts.shape}')
+        # print(f'rds has shape {rds.shape}')
+        rds = rds.unsqueeze(2).expand(NV, num_rays, self.n_coarse, -1)
 
-        # Reshape pts to (batch_size, -1, 3).
-        pts = pts.reshape(1,-1,3)  # To comply with pixelnerf input
+        # 
+        pts = pts.reshape(1,-1,3)  # (1, NV*num_ways, 3)
+        rds = rds.reshape(1,-1,3)
+
+        # Input view directions
+        # (NV*num_ways, 3)
 
         # Sample the radiance field with the points along the rays.
-        sigma_rad = radiance_field(pts)
+        sigma_rad = radiance_field(pts, viewdirs=rds)
         sigma_rad = sigma_rad.squeeze(0)   # Get rid of SB dimension
         sigma = sigma_rad[...,3]
         rad = sigma_rad[...,:3]
 
 
-        # Reshape sigma and rad back to (batch_size, num_rays, self.n_samples, -1)
+        # Reshape sigma and rad back to (NV, num_rays, self.n_samples, -1)
         sigma = sigma.view(NV, num_rays, self.n_coarse, 1)
         rad = rad.view(NV, num_rays, self.n_coarse, 3)
-
-        # print('pixelnerf output has colors')
-        # print(rad)
-        # print('pixelnerf output has densities')
-        # print(sigma)
-
-        # print('z values are')
-        # print(z_vals)
 
         # Compute pixel colors, depths, and weights via the volume integral.
         rgb, depth_map, weights = volume_integral(z_vals, sigma, rad)
 
-        # print('volume renderer output has colors')
-        # print(rgb)
-        # print('volume renderer output has depth')
-        # print(depth_map)
+        if self.white_back:
+            accum = weights.sum(dim=-2)
+            rgb = rgb + (1. - accum)
+
+        return rgb, depth_map
+
+    @classmethod
+    def from_conf(cls, conf, white_back=False):
+        return cls(
+            near=conf.get_float("near", 1.0),
+            far=conf.get_float("far", 2.5),
+            n_coarse=conf.get_int("n_coarse", 32),
+            n_fine=conf.get_int("n_fine", 16),
+            n_fine_depth=conf.get_int("n_fine_depth", 8),
+            depth_std=conf.get_float("depth_std", 0.01),
+            white_back=conf.get_float("white_back", white_back),
+        )
+
+class AdaptiveVolumeRenderer(nn.Module):
+    def __init__(self, near=1.0, far=2.5, n_coarse=32, n_fine=16, n_fine_depth=8, depth_std = 0.01, white_back=True):
+        super().__init__()
+        self.near = near
+        self.far = far
+        self.n_coarse = n_coarse
+        self.n_fine = n_fine
+        self.n_fine_depth = n_fine_depth
+        self.depth_std = depth_std
+        self.white_back = white_back
+
+    def forward(
+        self, 
+        cam2world,
+        intrinsics,
+        x_pix,
+        radiance_field: nn.Module
+        ) -> Tuple[torch.tensor, torch.tensor]:
+        """
+        Takes as inputs ray origins and directions - samples points along the 
+        rays and then calculates the volume rendering integral. 
+
+        Params:
+            input_dict: Dictionary with keys 'cam2world', 'intrinsics', and 'x_pix'
+                here x_pix has size (B,2)
+            radiance_field: nn.Module instance of the radiance field we want to render. This should by default the PixelNeRF. 
+                Params: 
+                    xyz: points in space, with shape (SB,B,3)
+                        SB is batch of objects
+                        B is batch of points (in rays)
+                Return:
+                    (SB, B, 4) of r g b sigma
+
+        Returns:
+            Tuple of rgb, depth_map
+            rgb: for each pixel coordinate x_pix, the color of the respective ray.
+            depth_map: for each pixel coordinate x_pix, the depth of the respective ray.
+ 
+        """
+        NV, num_rays, _ = x_pix.shape  # _ should be 2, since each pixel coordinate has 2 inputs
+
+        # Compute the ray directions in world coordinates.
+        # Use the function get_world_rays.
+        ros, rds = get_world_rays(x_pix, intrinsics, cam2world)
+
+        # Generate the points along rays and their depth values
+        # Use the function sample_points_along_rays.
+        pts, z_vals = sample_points_along_rays(self.near, self.far, self.n_coarse, 
+                                                ros, rds, device=x_pix.device) # pts has shape (NV, num_rays, 3)
+        # print(f'pts has shape {pts.shape}')
+        # print(f'rds has shape {rds.shape}')
+        rds = rds.unsqueeze(2).expand(NV, num_rays, self.n_coarse, -1)
+
+        # 
+        pts = pts.reshape(1,-1,3)  # (1, NV*num_ways, 3)
+        rds = rds.reshape(1,-1,3)
+
+        # Input view directions
+        # (NV*num_ways, 3)
+
+        # Sample the radiance field with the points along the rays.
+        sigma_rad = radiance_field(pts, viewdirs=rds)
+        sigma_rad = sigma_rad.squeeze(0)   # Get rid of SB dimension
+        sigma = sigma_rad[...,3]
+        rad = sigma_rad[...,:3]
+
+
+        # Reshape sigma and rad back to (NV, num_rays, self.n_samples, -1)
+        sigma = sigma.view(NV, num_rays, self.n_coarse, 1)
+        rad = rad.view(NV, num_rays, self.n_coarse, 3)
+
+        # Compute pixel colors, depths, and weights via the volume integral.
+        rgb, depth_map, weights = volume_integral(z_vals, sigma, rad)
 
         if self.white_back:
             accum = weights.sum(dim=-2)
@@ -206,7 +292,7 @@ class VolumeRenderer(nn.Module):
         )
 
 # Question: Should we train raymarcher first then train constant step volume renderer or train both at the same time?
-class AdaptiveVolumeRenderer(nn.Module):
+class OldAdaptiveVolumeRenderer(nn.Module):
     def __init__(self, near, far, num_feature_channels, raymarch_steps, hidden_size = 16, n_coarse=32, n_fine=16, n_fine_depth=8, depth_std = 0.01, white_back=True):
         super().__init__()
         self.near = near
