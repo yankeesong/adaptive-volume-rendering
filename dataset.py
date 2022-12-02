@@ -105,6 +105,7 @@ class SRNsCars(IterableDataset):
                            "focal": intrinsics[0,0],
                            "c":torch.tensor([intrinsics[0,2], intrinsics[1,2]], dtype=torch.float32),
                            "x_pix": x_pix,
-                           "idx": torch.tensor([idx])}
+                           "idx": torch.tensor([idx]),
+                           "images": rgb}
 
-            yield model_input, rgb
+            yield model_input

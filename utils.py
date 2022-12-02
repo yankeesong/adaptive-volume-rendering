@@ -180,3 +180,5 @@ def get_opencv_pixel_coordinates(
 
     xy_pix = torch.stack([i.float(), j.float()], dim=-1).permute(1, 0, 2)
     return xy_pix
+
+# Dataset utils

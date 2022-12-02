@@ -15,25 +15,34 @@ def fit(
     losses = []
     for step in range(total_steps):
         # Get the next batch of data and move it to the GPU
-        model_input, ground_truth = next(data_iterator)
+        model_input = next(data_iterator)
+        model_input = to_gpu(model_input)
+        ground_truth = model_input["images"] # (NV, H*W, 3)
 
-        model_input, ground_truth = to_gpu(model_input), to_gpu(ground_truth)
+        NV, sl2, _ = ground_truth.shape
+        NS = 1 # Number of source views, san only handle one now
+        sl = int(np.sqrt(sl2))
+
+        # Extract source images (randomly determine)
+        src_idx = to_gpu(np.random.choice(NV, NS, replace=False))
+
 
         # Encode
-        # :param images (SB, NS, 3, H, W)
-        # NS is number of input (aka source or reference) views, now can only deal with 1
-        # :param poses (SB, NS, 4, 4)
+        # :param images (NS, 3, H, W)
+        # NS is number of source views, now can only deal with 1
+        # :param poses (NS, 4, 4)
         # :param focal focal length () or (2) or (NS) or (NS, 2) [fx, fy]
         # :param z_bounds ignored argument (used in the past)
         # :param c principal point None or () or (2) or (NS) or (NS, 2) [cx, cy],
         # default is center of image
-        sl = int(np.sqrt(ground_truth.shape[1]))
-        images = ground_truth.reshape(-1,sl,sl,3).permute(0,3,1,2)
-        poses = model_input['cam2world']
-        focal = model_input['focal']
-        c = model_input['c']
+        src_images = ground_truth[src_idx,...].reshape(-1,sl,sl,3).permute(0,3,1,2)
+        print(f'source image has size {src_images.shape}')
+        poses = model_input['cam2world'][src_idx,...]
+        print(f'poses has size {poses.shape}')
+        focal = model_input['focal'][src_idx,...]
+        c = model_input['c'][src_idx,...]
         
-        net.encode(images, poses, focal, c)
+        net.encode(src_images, poses, focal, c)
 
         # Compute the MLP output for the given input data and compute the loss
         model_output = model(model_input)
