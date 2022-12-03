@@ -65,7 +65,7 @@ def sample_points_along_rays(
     device: torch.device
 ):
     # Compute a linspace of num_samples depth values beetween near_depth and far_depth.
-    z_vals = torch.linspace(near_depth, far_depth, num_samples, device=device)
+    z_vals = torch.linspace(near_depth, far_depth - (far_depth-near_depth)/num_samples, num_samples, device=device)
 
     # Using the ray_origins, ray_directions, generate 3D points along
     # the camera rays according to the z_vals.

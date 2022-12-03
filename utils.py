@@ -43,39 +43,6 @@ def init_weights(m):
     if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv2d):
         torch.nn.init.kaiming_normal_(m.weight)
 
-#
-def unproj_map_pixelnerf(width, height, f, c=None, device="cpu"):
-    """
-    Get camera unprojection map for given image size.
-    [y,x] of output tensor will contain unit vector of camera ray of that pixel.
-    :param width image width
-    :param height image height
-    :param f focal length, either a number or tensor [fx, fy]
-    :param c principal point, optional, either None or tensor [fx, fy]
-    if not specified uses center of image
-    :return unproj map (height, width, 3)
-    """
-    if c is None:
-        c = [width * 0.5, height * 0.5]
-    else:
-        c = c.squeeze()
-    if isinstance(f, float):
-        f = [f, f]
-    elif len(f.shape) == 0:
-        f = f[None].expand(2)
-    elif len(f.shape) == 1:
-        f = f.expand(2)
-    Y, X = torch.meshgrid(
-        torch.arange(height, dtype=torch.float32) - float(c[1]),
-        torch.arange(width, dtype=torch.float32) - float(c[0]),
-    )
-    X = X.to(device=device) / float(f[0])
-    Y = Y.to(device=device) / float(f[1])
-    Z = torch.ones_like(X)
-    unproj = torch.stack((X, -Y, -Z), dim=-1)
-    unproj /= torch.norm(unproj, dim=-1).unsqueeze(-1)
-    return unproj
-
 
 
 
@@ -124,6 +91,8 @@ def unproject(
     """
     xy_pix_hom = homogenize_points(xy_pix)
     xyz_cam = torch.einsum('...ij,...kj->...ki', intrinsics.inverse(), xy_pix_hom)
+    x_cam = xyz_cam[...,0]
+    xyz_cam[...,0] = -x_cam
     xyz_cam *= z
     return xyz_cam
     
@@ -215,29 +184,11 @@ def get_opencv_pixel_coordinates(
         xy_pix: a meshgrid of values from [0, 1] of shape 
                 (y_resolution, x_resolution, 2)
     """
-    i, j = torch.meshgrid(torch.linspace(0, 1, steps=x_resolution), 
-                          torch.linspace(0, 1, steps=y_resolution))
+    i, j = torch.meshgrid(torch.linspace(0, 1-1/x_resolution, steps=x_resolution), 
+                          torch.linspace(0, 1-1/x_resolution, steps=y_resolution))
 
     xy_pix = torch.stack([i.float(), j.float()], dim=-1).permute(1, 0, 2)
     return xy_pix
 
-def get_pixelnerf_pixel_coordinates(
-    y_resolution: int,
-    x_resolution: int,
-    ):
-    """For an image with y_resolution and x_resolution, return a tensor of pixel coordinates
-    normalized to lie in [0, 1], with the origin (0, 0) in the top left corner,
-    the x-axis pointing right, the y-axis pointing down, and the bottom right corner
-    being at (1, 1).
-
-    Returns:
-        xy_pix: a meshgrid of values from [0, 1] of shape 
-                (y_resolution, x_resolution, 2)
-    """
-    i, j = torch.meshgrid(torch.linspace(0, 1, steps=x_resolution), 
-                          torch.linspace(0, 1, steps=y_resolution))
-
-    xy_pix = torch.stack([-i.float(), j.float()], dim=-1).permute(1, 0, 2)
-    return xy_pix
 
 # Dataset utils

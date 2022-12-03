@@ -71,7 +71,7 @@ class SRNsCars(IterableDataset):
             observation_idx = np.random.randint(0, len(rgb_keys))
             rgb = parse_rgb( rgbs_ds[rgb_keys[observation_idx]] )
 
-            x_pix = get_pixelnerf_pixel_coordinates(*rgb.shape[:2])
+            x_pix = get_opencv_pixel_coordinates(*rgb.shape[:2])
 
             # There is a lot of white-space around the cars - we'll thus crop the images a bit:
             # rgb = rgb[32:-32, 32:-32]
