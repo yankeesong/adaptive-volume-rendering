@@ -108,7 +108,7 @@ def volume_integral(
 
 
 class VolumeRenderer(nn.Module):
-    def __init__(self, near=1.0, far=2.5, n_coarse=32, n_fine=16, n_fine_depth=8, depth_std = 0.01, white_back=True):
+    def __init__(self, near=0.8, far=1.8, n_coarse=32, n_fine=16, n_fine_depth=8, depth_std = 0.01, white_back=True):
         super().__init__()
         self.near = near
         self.far = far
@@ -168,7 +168,7 @@ class VolumeRenderer(nn.Module):
         # (NV*num_ways, 3)
 
         # Sample the radiance field with the points along the rays.
-        sigma_rad = radiance_field(pts, viewdirs=rds)
+        sigma_rad = radiance_field(pts, viewdirs=rds) # (SB, NV*num_rays, 4)
         sigma_rad = sigma_rad.squeeze(0)   # Get rid of SB dimension
         sigma = sigma_rad[...,3]
         rad = sigma_rad[...,:3]
@@ -190,8 +190,8 @@ class VolumeRenderer(nn.Module):
     @classmethod
     def from_conf(cls, conf, white_back=False):
         return cls(
-            near=conf.get_float("near", 1.0),
-            far=conf.get_float("far", 2.5),
+            near=conf.get_float("near", 0.8),
+            far=conf.get_float("far", 1.8),
             n_coarse=conf.get_int("n_coarse", 32),
             n_fine=conf.get_int("n_fine", 16),
             n_fine_depth=conf.get_int("n_fine_depth", 8),

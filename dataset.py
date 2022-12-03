@@ -34,6 +34,8 @@ def parse_pose(hdf5_dataset):
         pose[i // 4, i % 4] = lines[0].split(" ")[i]
     
     pose = torch.from_numpy(pose.squeeze())
+    pose = pose @ torch.diag(
+            torch.tensor([1, -1, -1, 1], dtype=torch.float32))
     return pose
     
 
@@ -69,11 +71,11 @@ class SRNsCars(IterableDataset):
             observation_idx = np.random.randint(0, len(rgb_keys))
             rgb = parse_rgb( rgbs_ds[rgb_keys[observation_idx]] )
 
-            x_pix = get_opencv_pixel_coordinates(*rgb.shape[:2])
+            x_pix = get_pixelnerf_pixel_coordinates(*rgb.shape[:2])
 
             # There is a lot of white-space around the cars - we'll thus crop the images a bit:
-            rgb = rgb[32:-32, 32:-32]
-            x_pix = x_pix[32:-32, 32:-32]
+            # rgb = rgb[32:-32, 32:-32]
+            # x_pix = x_pix[32:-32, 32:-32]
 
             # Nearest-neighbor downsampling of *both* the
             # RGB image and the pixel coordinates. This is better than down-
@@ -97,14 +99,18 @@ class SRNsCars(IterableDataset):
 
             rgb = rearrange(rgb, 'i j c -> (i j) c')
 
+            # print(f'key is {key}')
+            # print(f'observation idx is {observation_idx}')
+            # print(f'pose key is {c2w_keys[observation_idx]}')
+
             intrinsics = parse_intrinsics( instance['intrinsics.txt'] )
             intrinsics[:2, :3] /= 128. # Normalize intrinsics from resolution-specific intrinsics for 128x128
 
             model_input = {"cam2world": c2w,
                            "intrinsics": intrinsics,
-                           "focal": intrinsics[0,0],
-                           "c":torch.tensor([intrinsics[0,2], intrinsics[1,2]], dtype=torch.float32),
-                           "x_pix": x_pix,
+                           "focal": intrinsics[0,0]*self.img_sidelength, # For pixelnerf
+                           "c":torch.tensor([intrinsics[0,2]*self.img_sidelength, intrinsics[1,2]*self.img_sidelength], dtype=torch.float32), # For pixelnerf
+                           "x_pix": x_pix, # For volume renderer
                            "idx": torch.tensor([idx]),
                            "images": rgb}
 

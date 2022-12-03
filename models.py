@@ -154,7 +154,7 @@ class NewPixelNeRFNet(torch.nn.Module):
         if self.use_global_encoder:
             self.global_encoder(images)
 
-    def forward(self, xyz, coarse=True, viewdirs=None, far=False):
+    def forward(self, xyz, coarse=True, viewdirs=None, far=False, return_features = False):
         """
         Predict (r, g, b, sigma) at world space points xyz.
         Please call encode first!
@@ -236,6 +236,9 @@ class NewPixelNeRFNet(torch.nn.Module):
                     mlp_input = latent
                 else:
                     mlp_input = torch.cat((latent, z_feature), dim=-1)
+            
+            if return_features:
+                return latent # (SB * NS * B, latent)
 
             if self.use_global_encoder:
                 # Concat global latent code if enabled
@@ -276,19 +279,19 @@ class NewPixelNeRFNet(torch.nn.Module):
             output = output.reshape(SB, B, -1)
         return output
 
-    def load_weights(self, args, opt_init=False, strict=True, device=None):
+    def load_weights(self, model_path, opt_init=False, strict=True, device=None):
         """
         Helper for loading weights according to argparse arguments.
         Your can put a checkpoint at checkpoints/<exp>/pixel_nerf_init to use as initialization.
         :param opt_init if true, loads from init checkpoint instead of usual even when resuming
         """
-        # TODO: make backups
-        if opt_init and not args.resume:
-            return
-        ckpt_name = (
-            "pixel_nerf_init" if opt_init or not args.resume else "pixel_nerf_latest"
-        )
-        model_path = "%s/%s/%s" % (args.checkpoints_path, args.name, ckpt_name)
+        # # TODO: make backups
+        # if opt_init and not args.resume:
+        #     return
+        # ckpt_name = (
+        #     "pixel_nerf_init" if opt_init or not args.resume else "pixel_nerf_latest"
+        # )
+        # model_path = "%s/%s/%s" % (args.checkpoints_path, args.name, ckpt_name)
 
         if device is None:
             device = self.poses.device
@@ -308,22 +311,22 @@ class NewPixelNeRFNet(torch.nn.Module):
             )
         return self
 
-    def save_weights(self, args, opt_init=False):
+    def save_weights(self, model_path, opt_init=False):
         """
         Helper for saving weights according to argparse arguments
         :param opt_init if true, saves from init checkpoint instead of usual
         """
         from shutil import copyfile
 
-        ckpt_name = "pixel_nerf_init" if opt_init else "pixel_nerf_latest"
-        backup_name = "pixel_nerf_init_backup" if opt_init else "pixel_nerf_backup"
+        # ckpt_name = "pixel_nerf_init" if opt_init else "pixel_nerf_latest"
+        # backup_name = "pixel_nerf_init_backup" if opt_init else "pixel_nerf_backup"
 
-        ckpt_path = osp.join(args.checkpoints_path, args.name, ckpt_name)
-        ckpt_backup_path = osp.join(args.checkpoints_path, args.name, backup_name)
+        # ckpt_path = osp.join(args.checkpoints_path, args.name, ckpt_name)
+        # ckpt_backup_path = osp.join(args.checkpoints_path, args.name, backup_name)
 
-        if osp.exists(ckpt_path):
-            copyfile(ckpt_path, ckpt_backup_path)
-        torch.save(self.state_dict(), ckpt_path)
+        # if osp.exists(ckpt_path):
+        #     copyfile(ckpt_path, ckpt_backup_path)
+        torch.save(self.state_dict(), model_path)
         return self
 
 
