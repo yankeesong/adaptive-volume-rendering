@@ -161,7 +161,7 @@ class VolumeRenderer(nn.Module):
         rds = rds.unsqueeze(2).expand(NV, num_rays, self.n_coarse, -1)
 
         # 
-        pts = pts.reshape(1,-1,3)  # (1, NV*num_ways, 3)
+        pts = pts.reshape(1,-1,3)  # (1, NV*num_rays, 3)
         rds = rds.reshape(1,-1,3)
 
         # Input view directions
@@ -197,6 +197,105 @@ class VolumeRenderer(nn.Module):
             n_fine_depth=conf.get_int("n_fine_depth", 8),
             depth_std=conf.get_float("depth_std", 0.01),
             white_back=conf.get_float("white_back", white_back),
+        )
+
+
+class Raymarcher(nn.Module):
+    def __init__(self,
+                 num_feature_channels,
+                 raymarch_steps):
+        super().__init__()
+
+        self.n_feature_channels = num_feature_channels
+        self.steps = raymarch_steps
+
+        hidden_size = 16
+        self.lstm = nn.LSTMCell(input_size=self.n_feature_channels,
+                                hidden_size=hidden_size)
+
+        self.lstm.apply(init_recurrent_weights)
+        lstm_forget_gate_init(self.lstm)
+
+        self.out_layer = nn.Linear(hidden_size, 1)
+        self.counter = 0
+
+    def forward(self,
+                cam2world,
+                intrinsics,
+                uv,
+                phi):
+        batch_size, num_samples, _ = uv.shape
+        log = list()
+
+        ray_dirs = get_ray_directions(uv, cam2world=cam2world, intrinsics=intrinsics)
+
+        initial_depth = torch.zeros((batch_size, num_samples, 1)).normal_(mean=0.05, std=5e-4).to(uv.device)
+        init_world_coords = world_from_xy_depth(uv, initial_depth, intrinsics=intrinsics, cam2world=cam2world)
+
+        world_coords = [init_world_coords]
+        depths = [initial_depth]
+        states = [None]
+
+
+        for step in range(self.steps):
+            world_coords[-1] = world_coords[-1].reshape(1,-1,3)  # (1, batch_size*num_samples, 3)
+            ray_dirs = ray_dirs.reshape(1,-1,3)
+
+            v = phi(world_coords[-1], viewdirs = ray_dirs, return_features = True)
+
+            state = self.lstm(v.reshape(-1, self.n_feature_channels), states[-1])
+
+            if state[0].requires_grad:
+                state[0].register_hook(lambda x: x.clamp(min=-10, max=10))
+
+            signed_distance = self.out_layer(state[0]).view(batch_size, num_samples, 1)
+            ray_dirs = ray_dirs.reshape(batch_size, num_samples,3)
+            world_coords[-1] = world_coords[-1].reshape(batch_size, num_samples,3)
+            new_world_coords = world_coords[-1] + ray_dirs * signed_distance
+
+            states.append(state)
+            world_coords.append(new_world_coords)
+
+            depth = depth_from_world(world_coords[-1], cam2world)
+            # commented out for now
+            # if self.training:
+            #     print("Raymarch step %d: Min depth %0.6f, max depth %0.6f" %
+            #           (step, depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
+
+            depths.append(depth)
+
+        # commented out for now
+        # if not self.counter % 100:
+        #     # Write tensorboard summary for each step of ray-marcher.
+        #     drawing_depths = torch.stack(depths, dim=0)[:, 0, :, :]
+        #     drawing_depths = lin2img(drawing_depths).repeat(1, 3, 1, 1)
+        #     log.append(('image', 'raycast_progress',
+        #                 torch.clamp(torchvision.utils.make_grid(drawing_depths, scale_each=False, normalize=True), 0.0,
+        #                             5),
+        #                 100))
+
+        #     # Visualize residual step distance (i.e., the size of the final step)
+        #     fig = show_images([lin2img(signed_distance)[i, :, :, :].detach().cpu().numpy().squeeze()
+        #                             for i in range(batch_size)])
+        #     log.append(('figure', 'stopping_distances', fig, 100))
+        self.counter += 1
+
+        world_coords[-1] = world_coords[-1].reshape(1,-1,3)  # (1, batch_size*num_samples, 3)
+        ray_dirs = ray_dirs.reshape(1,-1,3)
+
+        output = phi(world_coords[-1], viewdirs = ray_dirs, return_features = False)
+
+
+        rgb = output[..., :3].reshape(batch_size, num_samples,3)
+        sigma = output[..., 3:4].reshape(batch_size, num_samples,1)
+        # return world_coords[-1], depths[-1], log
+        return rgb, sigma
+
+    @classmethod
+    def from_conf(cls, conf):
+        return cls(
+            num_feature_channels=conf.get_int("num_feature_channels", 512),
+            raymarch_steps = conf.get_int("raymarch_steps", 10),
         )
 
 class AdaptiveVolumeRenderer(nn.Module):
@@ -291,7 +390,7 @@ class AdaptiveVolumeRenderer(nn.Module):
             white_back=conf.get_float("white_back", white_back),
         )
 
-# Question: Should we train raymarcher first then train constant step volume renderer or train both at the same time?
+
 class OldAdaptiveVolumeRenderer(nn.Module):
     def __init__(self, near, far, num_feature_channels, raymarch_steps, hidden_size = 16, n_coarse=32, n_fine=16, n_fine_depth=8, depth_std = 0.01, white_back=True):
         super().__init__()
