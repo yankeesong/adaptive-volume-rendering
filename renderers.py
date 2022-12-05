@@ -1,10 +1,10 @@
 from utils import *
-import sys
-#root_dir = "/Users/jameszli/desktop/MIT/6.S980/"  
-#sys.path.insert(0, f"{root_dir}/scene-representation-networks/")
-from geometry import *
-from util import *
-#from pytorch_prototyping import pytorch_prototyping
+# import sys
+# #root_dir = "/Users/jameszli/desktop/MIT/6.S980/"  
+# #sys.path.insert(0, f"{root_dir}/scene-representation-networks/")
+# from geometry import *
+# from util import *
+# #from pytorch_prototyping import pytorch_prototyping
 
 def init_recurrent_weights(self):
     for m in self.modules():

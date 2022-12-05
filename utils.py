@@ -190,5 +190,91 @@ def get_opencv_pixel_coordinates(
     xy_pix = torch.stack([i.float(), j.float()], dim=-1).permute(1, 0, 2)
     return xy_pix
 
+# functions from SRN
+def parse_intrinsics(intrinsics):
+    # intrinsics = intrinsics.cuda()
+
+    fx = intrinsics[:, 0, 0]
+    fy = intrinsics[:, 1, 1]
+    cx = intrinsics[:, 0, 2]
+    cy = intrinsics[:, 1, 2]
+    return fx, fy, cx, cy
+
+
+def expand_as(x, y):
+    if len(x.shape) == len(y.shape):
+        return x
+
+    for i in range(len(y.shape) - len(x.shape)):
+        x = x.unsqueeze(-1)
+
+    return x
+
+
+def lift(x, y, z, intrinsics, homogeneous=False):
+    '''
+
+    :param self:
+    :param x: Shape (batch_size, num_points)
+    :param y:
+    :param z:
+    :param intrinsics:
+    :return:
+    '''
+    fx, fy, cx, cy = parse_intrinsics(intrinsics)
+
+    x_lift = (x - expand_as(cx, x)) / expand_as(fx, x) * z
+    y_lift = (y - expand_as(cy, y)) / expand_as(fy, y) * z
+
+    if homogeneous:
+        return torch.stack((x_lift, y_lift, z, torch.ones_like(z).to(z.device)), dim=-1)
+    else:
+        return torch.stack((x_lift, y_lift, z), dim=-1)
+
+def world_from_xy_depth(xy, depth, cam2world, intrinsics):
+    '''Translates meshgrid of xy pixel coordinates plus depth to  world coordinates.
+    '''
+    batch_size, _, _ = cam2world.shape
+
+    x_cam = xy[:, :, 0].view(batch_size, -1)
+    y_cam = xy[:, :, 1].view(batch_size, -1)
+    z_cam = depth.view(batch_size, -1)
+
+    pixel_points_cam = lift(x_cam, y_cam, z_cam, intrinsics=intrinsics, homogeneous=True)  # (batch_size, -1, 4)
+
+    # permute for batch matrix product
+    pixel_points_cam = pixel_points_cam.permute(0, 2, 1)
+
+    world_coords = torch.bmm(cam2world, pixel_points_cam).permute(0, 2, 1)[:, :, :3]  # (batch_size, -1, 3)
+
+    return world_coords
+
+def get_ray_directions(xy, cam2world, intrinsics):
+    '''Translates meshgrid of xy pixel coordinates to normalized directions of rays through these pixels.
+    '''
+    batch_size, num_samples, _ = xy.shape
+
+    z_cam = torch.ones((batch_size, num_samples)).to(xy.device)
+    pixel_points = world_from_xy_depth(xy, z_cam, intrinsics=intrinsics, cam2world=cam2world)  # (batch, num_samples, 3)
+
+    cam_pos = cam2world[:, :3, 3]
+    ray_dirs = pixel_points - cam_pos[:, None, :]  # (batch, num_samples, 3)
+    ray_dirs = F.normalize(ray_dirs, dim=2)
+    return ray_dirs
+
+
+def depth_from_world(world_coords, cam2world):
+    batch_size, num_samples, _ = world_coords.shape
+
+    points_hom = torch.cat((world_coords, torch.ones((batch_size, num_samples, 1)).to(world_coords.device)),
+                           dim=2)  # (batch, num_samples, 4)
+
+    # permute for bmm
+    points_hom = points_hom.permute(0, 2, 1)
+
+    points_cam = torch.inverse(cam2world).bmm(points_hom)  # (batch, 4, num_samples)
+    depth = points_cam[:, 2, :][:, :, None]  # (batch, num_samples, 1)
+    return depth
+
 
 # Dataset utils
