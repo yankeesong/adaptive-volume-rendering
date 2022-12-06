@@ -3,7 +3,7 @@ from utils import *
 def fit(
     net: nn.Module,
     model: nn.Module,
-    data_iterator,
+    data_loader,
     loss_fn,
     resolution: Tuple,
     optimizer,
@@ -13,10 +13,15 @@ def fit(
    ):
 
     losses = []
+    data_iterator = iter(data_loader)
     for step in range(total_steps):
-        print(step)
         # Get the next batch of data and move it to the GPU
-        model_input = next(data_iterator)
+        try:
+            model_input = next(data_iterator)
+        except StopIteration:
+            data_iterator = iter(data_loader)
+            model_input = next(data_iterator)
+
         model_input = to_gpu(model_input)
         ground_truth = model_input["images"] # (NV, H*W, 3), values are between 0 and 1
 
@@ -26,6 +31,7 @@ def fit(
 
         # Extract source images (randomly determine)
         src_idx = to_gpu(np.random.choice(NV, NS, replace=False))
+        
 
 
         # Encode
@@ -65,6 +71,8 @@ def fit(
         # It would be boring otherwise!
         if not step % steps_til_summary:
             print(f"Step {step}: loss = {float(loss.detach().cpu()):.5f}")
+            if src_idx == 0:
+                print(f'same view dir as src')
 
             if plotting_function is not None: # Note: we now call the "plotting function" instead of hard-coding the plotting here.
                 plotting_function(model_output, ground_truth, resolution)

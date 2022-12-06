@@ -308,7 +308,7 @@ class Raymarcher(nn.Module):
         #ray_dirs = get_ray_directions(uv, cam2world=cam2world, intrinsics=intrinsics)
         ros, rds = get_world_rays(xy_pix, intrinsics=intrinsics, cam2world=cam2world) # (NV, num_rays, 3)
 
-        initial_depth = torch.zeros((NV, num_rays, 1)).normal_(mean=0.8, std=5e-4).to(xy_pix.device)
+        initial_depth = torch.zeros((NV, num_rays, 1)).normal_(mean=0.8, std=5e-3).to(xy_pix.device)
 
         init_world_coords = ros + rds * initial_depth
 
@@ -336,8 +336,8 @@ class Raymarcher(nn.Module):
             depth = depth_from_world(world_coords[-1], cam2world)
             # commented out for now
 
-            print("Raymarch step %d: Min depth %0.6f, max depth %0.6f" %
-                      (step, depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
+            # print("Raymarch step %d: Min depth %0.6f, max depth %0.6f" %
+            #           (step, depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
 
             depths.append(depth)
 
@@ -363,7 +363,7 @@ class Raymarcher(nn.Module):
         rgb = output[..., :3].reshape(NV, num_rays,3)
         sigma = output[..., 3:4].reshape(NV, num_rays,1) 
         # return world_coords[-1], depths[-1], log
-        return rgb, sigma # sigma isn't depth, but should affect loss calculation
+        return rgb, sigma # sigma isn't depth, but should not affect loss calculation
 
     @classmethod
     def from_conf(cls, conf):
