@@ -305,7 +305,6 @@ class Raymarcher(nn.Module):
                 phi):  # Here phi is pixelnerf net
         NV, num_rays, _ = xy_pix.shape
 
-        #ray_dirs = get_ray_directions(uv, cam2world=cam2world, intrinsics=intrinsics)
         ros, rds = get_world_rays(xy_pix, intrinsics=intrinsics, cam2world=cam2world) # (NV, num_rays, 3)
 
         initial_depth = torch.zeros((NV, num_rays, 1)).normal_(mean=0.8, std=5e-3).to(xy_pix.device)
@@ -399,7 +398,7 @@ class AdaptiveVolumeRenderer(nn.Module):
         self,
         cam2world,
         intrinsics,
-        uv,
+        xy_pix,
         phi
         ) -> Tuple[torch.tensor, torch.tensor]:
         """
@@ -424,12 +423,13 @@ class AdaptiveVolumeRenderer(nn.Module):
  
         """
 
-        batch_size, num_samples, _ = uv.shape
+        NV, num_rays, _ = xy_pix.shape
 
-        ray_dirs = get_ray_directions(uv, cam2world=cam2world, intrinsics=intrinsics)
+        ros, rds = get_world_rays(xy_pix, intrinsics=intrinsics, cam2world=cam2world) # (NV, num_rays, 3)
 
-        initial_depth = torch.zeros((batch_size, num_samples, 1)).normal_(mean=0.05, std=5e-4).to(uv.device)
-        init_world_coords = world_from_xy_depth(uv, initial_depth, intrinsics=intrinsics, cam2world=cam2world)
+        initial_depth = torch.zeros((NV, num_rays, 1)).normal_(mean=0.8, std=5e-3).to(xy_pix.device)
+
+        init_world_coords = ros + rds * initial_depth
 
         world_coords = [init_world_coords]
         depths = [initial_depth]
@@ -437,46 +437,43 @@ class AdaptiveVolumeRenderer(nn.Module):
 
 
         for step in range(self.steps):
-            world_coords[-1] = world_coords[-1].reshape(1,-1,3)  # (1, batch_size*num_samples, 3)
-            ray_dirs = ray_dirs.reshape(1,-1,3)
 
-            v = phi(world_coords[-1], viewdirs = ray_dirs, return_features = True)
+            v = phi(world_coords[-1].reshape(1,-1,3), viewdirs = rds.reshape(1,-1,3), return_features = True)   # (1, NV*num_rays, self.n_feature_channels)
 
-            state = self.lstm(v.reshape(-1, self.n_feature_channels), states[-1])
+            state = self.lstm(v.squeeze(0), states[-1])  # (NV*num_rays, self.n_feature_channels)
 
             if state[0].requires_grad:
                 state[0].register_hook(lambda x: x.clamp(min=-10, max=10))
 
-            signed_distance = self.out_layer(state[0]).view(batch_size, num_samples, 1)
-            ray_dirs = ray_dirs.reshape(batch_size, num_samples,3)
-            world_coords[-1] = world_coords[-1].reshape(batch_size, num_samples,3)
-            new_world_coords = world_coords[-1] + ray_dirs * signed_distance
+            signed_distance = self.out_layer(state[0]).view(NV, num_rays, 1) # (NV, num_rays, 1)
+
+            new_world_coords = world_coords[-1] + rds * signed_distance
 
             states.append(state)
             world_coords.append(new_world_coords)
 
             depth = depth_from_world(world_coords[-1], cam2world)
             # commented out for now
-            # if self.training:
-            #     print("Raymarch step %d: Min depth %0.6f, max depth %0.6f" %
+
+            # print("Raymarch step %d: Min depth %0.6f, max depth %0.6f" %
             #           (step, depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
 
             depths.append(depth)
             
         # Compute the ray directions in world coordinates.
         # Use the function get_world_rays.
-        ros, rds = get_world_rays(uv, intrinsics, cam2world)
+        ros, rds = get_world_rays(xy_pix, intrinsics, cam2world)
 
         # Generate the points along rays and their depth values
         # Use the function sample_points_along_rays.
         # print("start")
         # a = time.time()
         pts, z_vals = batch_sample_points_along_rays(depths[-1] - self.epsilon, depth[-1] + self.epsilon, self.n_coarse, 
-                                                ros, rds, device=uv.device) # pts has shape (NV, num_rays, 3)
+                                                ros, rds, device=xy_pix.device) # pts has shape (NV, num_rays, 3)
         # print("end", time.time() - a)
 
 
-        rds = rds.unsqueeze(2).expand(batch_size, num_samples, self.n_coarse, -1)
+        rds = rds.unsqueeze(2).expand(NV, num_rays, self.n_coarse, -1)
 
         # 
         pts = pts.reshape(1,-1,3)  # (1, NV*num_ways, 3)
@@ -493,8 +490,8 @@ class AdaptiveVolumeRenderer(nn.Module):
 
 
         # Reshape sigma and rad back to (NV, num_rays, self.n_samples, -1)
-        sigma = sigma.view(batch_size, num_samples, self.n_coarse, 1)
-        rad = rad.view(batch_size, num_samples, self.n_coarse, 3)
+        sigma = sigma.view(NV, num_rays, self.n_coarse, 1)
+        rad = rad.view(NV, num_rays, self.n_coarse, 3)
 
         # print(f'z_vals has shape {z_vals.shape}')
         # print(f'sigma has shape {sigma.shape}')
