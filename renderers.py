@@ -282,7 +282,7 @@ class VolumeRenderer(nn.Module):
 class Raymarcher(nn.Module):
     def __init__(self,
                  num_feature_channels,
-                 raymarch_steps):
+                 raymarch_steps, near = 0.5, far = 2.0):
         super().__init__()
 
         self.n_feature_channels = num_feature_channels
@@ -297,6 +297,9 @@ class Raymarcher(nn.Module):
 
         self.out_layer = nn.Linear(hidden_size, 1)
         self.counter = 0
+
+        self.near = near
+        self.far = far
 
     def forward(self,
                 cam2world,
@@ -333,12 +336,12 @@ class Raymarcher(nn.Module):
             world_coords.append(new_world_coords)
 
             depth = depth_from_world(world_coords[-1], cam2world)
-            # commented out for now
-
-            # print("Raymarch step %d: Min depth %0.6f, max depth %0.6f" %
-            #           (step, depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
 
             depths.append(depth)
+
+        # commented out for now
+        print("Final step: Min depth %0.6f, max depth %0.6f" %
+                      (depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
 
         # commented out for now
         # if not self.counter % 100:
@@ -361,8 +364,9 @@ class Raymarcher(nn.Module):
 
         rgb = output[..., :3].reshape(NV, num_rays,3)
         sigma = output[..., 3:4].reshape(NV, num_rays,1) 
+        final_depth = depths[-1].reshape(NV, num_rays, -1)
         # return world_coords[-1], depths[-1], log
-        return rgb, sigma # sigma isn't depth, but should not affect loss calculation
+        return rgb, final_depth # See here the output is a bit different
 
     @classmethod
     def from_conf(cls, conf):

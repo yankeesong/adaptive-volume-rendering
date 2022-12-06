@@ -58,7 +58,7 @@ def fit(
         model_output = model(model_input)
 
         # Implement a simple mean-squared-error loss between the 
-        loss = loss_fn(model_output, ground_truth, model) # Note: loss now takes "model" as input.
+        loss = loss_fn(model_output, ground_truth) # Note: loss now takes "model" as input.
 
         optimizer.zero_grad()
         loss.backward()
@@ -79,9 +79,15 @@ def fit(
 
     return model_output
 
-def mse_loss(mlp_out, gt, model):
+def mse_loss(mlp_out, gt):
     img, depth = mlp_out
     return ((img - gt)**2).mean()
+
+def mse_regularization_loss(mlp_out, gt, near=0.5, far=2.0):
+    # add regularization loss
+    img, depth = mlp_out
+    penalty = (torch.min(depth-near, torch.zeros_like(depth)) ** 2) + (torch.max(depth-far, torch.zeros_like(depth)) ** 2)
+    return ((img - gt)**2).mean() + torch.mean(penalty) * 10000
 
 def plot_output_ground_truth(model_output, ground_truth, resolution):
     img, depth = model_output
