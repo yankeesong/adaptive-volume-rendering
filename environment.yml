@@ -16,6 +16,9 @@ dependencies:
       - ipdb
       - pretrainedmodels
       - lpips
+      - einops
+      - gdown
+      - h5py
   - scipy
   - numpy
   - matplotlib
@@ -23,8 +26,4 @@ dependencies:
   - torchvision==0.7.0
   - scikit-image==0.17.2
   - tqdm
-  - ipdb
-  - lpips
-  - einops
-  - gdown
-  - h5py
+
