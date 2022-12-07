@@ -202,6 +202,15 @@ class SceneInstanceDataset():
         else:
             self.param_paths = []
 
+        # Filter out bad images
+        idcs = []
+        for i in range(len(self.pose_paths)):
+            if torch.from_numpy(load_pose(self.pose_paths[i]))[2,3]>0:
+                idcs.append(i)
+        self.color_paths = pick(self.color_paths, idcs)
+        self.pose_paths = pick(self.pose_paths, idcs)
+        self.param_paths = pick(self.param_paths, idcs)
+        
         if specific_observation_idcs is not None:
             self.color_paths = pick(self.color_paths, specific_observation_idcs)
             self.pose_paths = pick(self.pose_paths, specific_observation_idcs)
