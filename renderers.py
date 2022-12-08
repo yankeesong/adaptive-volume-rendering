@@ -339,9 +339,6 @@ class Raymarcher(nn.Module):
 
             depths.append(depth)
 
-        # commented out for now
-        print("Final step: Min depth %0.6f, max depth %0.6f" %
-                      (depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
 
         # commented out for now
         # if not self.counter % 100:
@@ -358,6 +355,13 @@ class Raymarcher(nn.Module):
         #                             for i in range(batch_size)])
         #     log.append(('figure', 'stopping_distances', fig, 100))
         self.counter += 1
+
+        # commented out for now
+        if not self.counter % 100:
+            print("Counter %d Final step: Min depth %0.6f, max depth %0.6f" %
+                          (self.counter,depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
+
+        output = phi(world_coords[-1].reshape(1,-1,3), viewdirs = rds.reshape(1,-1,3), return_features = False)
 
         output = phi(world_coords[-1].reshape(1,-1,3), viewdirs = rds.reshape(1,-1,3), return_features = False)
 
