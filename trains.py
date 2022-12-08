@@ -71,6 +71,10 @@ def fit(
         # It would be boring otherwise!
         if not step % steps_til_summary:
             print(f"Step {step}: loss = {float(loss.detach().cpu()):.5f}")
+#             print("Min depth %0.6f, max depth %0.6f" %
+#                           (model_output[1].min().detach().cpu().numpy(), model_output[1].max().detach().cpu().numpy()))
+#             print("Min color %0.6f, max color %0.6f" %
+#                           (model_output[0].min().detach().cpu().numpy(), model_output[0].max().detach().cpu().numpy()))
             if src_idx == 0:
                 print(f'same view dir as src')
 

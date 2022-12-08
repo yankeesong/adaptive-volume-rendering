@@ -102,6 +102,8 @@ def batch_sample_points_along_rays(
     device: torch.device
 ):
     # Compute a linspace of num_samples depth values beetween near_depth and far_depth.
+    print(f'far-near: {(far_depth-near_depth).min().detach().cpu().numpy()},{(far_depth-near_depth).max().detach().cpu().numpy()}')
+    print(near_depth.shape)
     z_vals = linspace(near_depth, far_depth - (far_depth-near_depth)/num_samples, num_samples)
 
     z_vals = z_vals.permute(1, 2, 0, 3).squeeze()
@@ -156,11 +158,15 @@ def batch_volume_integral(
         z_vals[..., 1:] - z_vals[..., :-1], 
         torch.broadcast_to(torch.Tensor([1e10]).to(z_vals.device), z_vals[...,:1].shape)
         ], -1) 
+#     print(f'dists: {dists.min().detach().cpu().numpy()},{dists.max().detach().cpu().numpy()}')
 
     # Compute the alpha values from the densities and the dists.
     # Tip: use torch.einsum for a convenient way of multiplying the correct 
     # dimensions of the sigmas and the dists.
     alpha = 1.- torch.exp(-torch.einsum('brzs, brz -> brzs', sigmas, dists))
+    
+#     print(f'alpha: {alpha.min().detach().cpu().numpy()},{alpha.max().detach().cpu().numpy()}')
+#     print(alpha.shape)
 
     # Compute the Ts from the alpha values. Use torch.cumprod.
     Ts = torch.cumprod(1.-alpha+1e-10, -2)
@@ -356,11 +362,6 @@ class Raymarcher(nn.Module):
         #     log.append(('figure', 'stopping_distances', fig, 100))
         self.counter += 1
 
-        # commented out for now
-        if not self.counter % 100:
-            print("Counter %d Final step: Min depth %0.6f, max depth %0.6f" %
-                          (self.counter,depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
-
         output = phi(world_coords[-1].reshape(1,-1,3), viewdirs = rds.reshape(1,-1,3), return_features = False)
 
         output = phi(world_coords[-1].reshape(1,-1,3), viewdirs = rds.reshape(1,-1,3), return_features = False)
@@ -369,6 +370,7 @@ class Raymarcher(nn.Module):
         rgb = output[..., :3].reshape(NV, num_rays,3)
         sigma = output[..., 3:4].reshape(NV, num_rays,1) 
         final_depth = depths[-1].reshape(NV, num_rays, -1)
+
         # return world_coords[-1], depths[-1], log
         return rgb, final_depth # See here the output is a bit different
 
@@ -380,7 +382,7 @@ class Raymarcher(nn.Module):
         )
 
 class AdaptiveVolumeRenderer(nn.Module):
-    def __init__(self, num_feature_channels, raymarch_steps, epsilon, n_coarse=32, white_back=True):
+    def __init__(self, num_feature_channels, raymarch_steps, epsilon, n_coarse=16, white_back=True):
         super().__init__()
         self.epsilon = epsilon
         self.n_coarse = n_coarse
@@ -467,17 +469,23 @@ class AdaptiveVolumeRenderer(nn.Module):
             #           (step, depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
 
             depths.append(depth)
+        
+#         print(f'depth out of raymarcher: {depths[-1].min().detach().cpu().numpy()},{depths[-1].max().detach().cpu().numpy()}')
             
         # Compute the ray directions in world coordinates.
         # Use the function get_world_rays.
         ros, rds = get_world_rays(xy_pix, intrinsics, cam2world)
+        
+        z_scales = rds[...,2].unsqueeze(2) # (NV, num_ways, 1)
 
         # Generate the points along rays and their depth values
         # Use the function sample_points_along_rays.
         # print("start")
         # a = time.time()
-        pts, z_vals = batch_sample_points_along_rays(depths[-1] - self.epsilon, depth[-1] + self.epsilon, self.n_coarse, 
-                                                ros, rds, device=xy_pix.device) # pts has shape (NV, num_rays, 3)
+        pts, z_vals = batch_sample_points_along_rays(depths[-1] - self.epsilon,
+                                                     depths[-1] + self.epsilon, 
+                                                     self.n_coarse, ros, rds, device=xy_pix.device) # pts has shape (NV, num_rays, 3)
+#         print(f'z values: {z_vals.min().detach().cpu().numpy()},{z_vals.max().detach().cpu().numpy()}')
         # print("end", time.time() - a)
 
 
@@ -500,15 +508,27 @@ class AdaptiveVolumeRenderer(nn.Module):
         # Reshape sigma and rad back to (NV, num_rays, self.n_samples, -1)
         sigma = sigma.view(NV, num_rays, self.n_coarse, 1)
         rad = rad.view(NV, num_rays, self.n_coarse, 3)
+        
+#         print(f'sigma: {sigma.min().detach().cpu().numpy()},{sigma.max().detach().cpu().numpy()}')
+#         print(f'rad: {rad.min().detach().cpu().numpy()},{rad.max().detach().cpu().numpy()}')
 
         # print(f'z_vals has shape {z_vals.shape}')
         # print(f'sigma has shape {sigma.shape}')
         # Compute pixel colors, depths, and weights via the volume integral.
         rgb, depth_map, weights = batch_volume_integral(z_vals, sigma, rad)
+        
+#         print(f'rgb: {rgb.min().detach().cpu().numpy()},{rgb.max().detach().cpu().numpy()}')
+#         print(f'depth_map: {depth_map.min().detach().cpu().numpy()},{depth_map.max().detach().cpu().numpy()}')
+#         print(f'weights: {weights.min().detach().cpu().numpy()},{weights.max().detach().cpu().numpy()}')
+
+
 
         if self.white_back:
             accum = weights.sum(dim=-2)
             rgb = rgb + (1. - accum)
+        
+        # Re-calculate depth map since rds now does not have z=1
+        depth_map = depth_map * torch.abs(z_scales)
 
         return rgb, depth_map
 
@@ -516,9 +536,9 @@ class AdaptiveVolumeRenderer(nn.Module):
     def from_conf(cls, conf, white_back=False):
         return cls(
             num_feature_channels=conf.get_int("num_feature_channels", 512),
-            raymarch_steps = conf.get_int("raymarch_steps", 10),
+            raymarch_steps = conf.get_int("raymarch_steps", 30),
             epsilon = conf.get_float("epsilon", 0.5),
-            n_coarse=conf.get_int("n_coarse", 32),
+            n_coarse=conf.get_int("n_coarse", 16),
             # near=conf.get_float("near", 1.0),
             # far=conf.get_float("far", 2.5),
             # n_coarse=conf.get_int("n_coarse", 32),

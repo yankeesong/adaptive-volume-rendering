@@ -293,9 +293,6 @@ class NewPixelNeRFNet(torch.nn.Module):
         # )
         # model_path = "%s/%s/%s" % (args.checkpoints_path, args.name, ckpt_name)
 
-        if device is None:
-            device = self.poses.device
-
         if os.path.exists(model_path):
             print("Load", model_path)
             self.load_state_dict(
@@ -351,3 +348,43 @@ class RadFieldAndRenderer(nn.Module):
                               )
         
         return rgb, depth
+    
+    def load_weights(self, model_path, opt_init=False, strict=True, device=None):
+        """
+        Helper for loading weights according to argparse arguments.
+        Your can put a checkpoint at checkpoints/<exp>/pixel_nerf_init to use as initialization.
+        :param opt_init if true, loads from init checkpoint instead of usual even when resuming
+        """
+
+        if os.path.exists(model_path):
+            print("Load", model_path)
+            self.load_state_dict(
+                torch.load(model_path, map_location=device), strict=strict
+            )
+        elif not opt_init:
+            warnings.warn(
+                (
+                    "WARNING: {} does not exist, not loaded!! Model will be re-initialized.\n"
+                    + "If you are trying to load a pretrained model, STOP since it's not in the right place. "
+                    + "If training, unless you are startin a new experiment, please remember to pass --resume."
+                ).format(model_path)
+            )
+        return self
+
+    def save_weights(self, model_path, opt_init=False):
+        """
+        Helper for saving weights according to argparse arguments
+        :param opt_init if true, saves from init checkpoint instead of usual
+        """
+        from shutil import copyfile
+
+        # ckpt_name = "pixel_nerf_init" if opt_init else "pixel_nerf_latest"
+        # backup_name = "pixel_nerf_init_backup" if opt_init else "pixel_nerf_backup"
+
+        # ckpt_path = osp.join(args.checkpoints_path, args.name, ckpt_name)
+        # ckpt_backup_path = osp.join(args.checkpoints_path, args.name, backup_name)
+
+        # if osp.exists(ckpt_path):
+        #     copyfile(ckpt_path, ckpt_backup_path)
+        torch.save(self.state_dict(), model_path)
+        return self
