@@ -102,7 +102,6 @@ def batch_sample_points_along_rays(
     device: torch.device
 ):
     # Compute a linspace of num_samples depth values beetween near_depth and far_depth.
-#     print(f'far-near: {(far_depth-near_depth).min().detach().cpu().numpy()},{(far_depth-near_depth).max().detach().cpu().numpy()}')
     z_vals = linspace(near_depth, far_depth - (far_depth-near_depth)/num_samples, num_samples)
 
     z_vals = z_vals.permute(1, 2, 0, 3).squeeze()
@@ -137,13 +136,13 @@ def volume_integral(
     # Compute the Ts from the alpha values. Use torch.cumprod.
     TTs = torch.cumprod(1.-alpha+1e-10, -2)
     
-#     Ts = torch.cat([
-#         torch.broadcast_to(torch.Tensor([1]).to(TTs.device), TTs[...,:1].shape),
-#         TTs[..., :-1],
-#         ], -1) 
+    Ts = torch.cat([
+        torch.broadcast_to(torch.Tensor([1]).to(TTs.device), TTs[...,:1].shape),
+        TTs[..., :-1],
+        ], -1) 
 
     # Compute the weights from the Ts and the alphas.
-    weights = alpha * TTs
+    weights = alpha * Ts
     
     # Compute the pixel color as the weighted sum of the radiance values.
     rgb = torch.einsum('brzs, brzs -> brs', weights, radiances)
@@ -173,8 +172,6 @@ def batch_volume_integral(
     # dimensions of the sigmas and the dists.
     alpha = 1.- torch.exp(-torch.einsum('brzs, brz -> brzs', sigmas, dists))
     
-#     print(f'alpha: {alpha.min().detach().cpu().numpy()},{alpha.max().detach().cpu().numpy()}')
-#     print(alpha.shape)
 
     # Compute the Ts from the alpha values. Use torch.cumprod.
     TTs = torch.cumprod(1.-alpha+1e-10, -2)
@@ -194,18 +191,8 @@ def batch_volume_integral(
     # Tip: use torch.einsum for a convenient way of computing the weighted sum,
     # without the need to reshape the z_vals.
 #     print(z_vals[0][528])
-#     print(sigmas[0][0])
-#     print(alpha[0][0])
-#     print(TTs[0][0])
-#     print(TTs.shape)
-#     print(Ts[0][528])
-#     print(radiances[0][500][:,0])
-#     print(weights[0][528])
-#     print(rgb[0][500][0])
-#     print(torch.sum(weights[0][528]))
 
     depth_map = torch.einsum('brzs, brz -> brs', weights, z_vals)
-#     print(depth_map[0][0])
 
     return rgb, depth_map, weights
 
@@ -281,9 +268,6 @@ class VolumeRenderer(nn.Module):
         # Reshape sigma and rad back to (NV, num_rays, self.n_samples, -1)
         sigma = sigma.view(NV, num_rays, self.n_coarse, 1)
         rad = rad.view(NV, num_rays, self.n_coarse, 3)
-        # print(z_vals.shape)
-        # print(f'sigma has shape {sigma.shape}')
-        # print(f'rad has shape {rad.shape}')
 
         # Compute pixel colors, depths, and weights via the volume integral.
         rgb, distance_map, weights = volume_integral(z_vals, sigma, rad) # (NV, num_rays, _)
@@ -293,9 +277,6 @@ class VolumeRenderer(nn.Module):
             rgb = rgb + (1. - accum)
         
         # Re-calculate depth map since rds now does not have z=1
-#         print(ros.shape)
-#         print(rds.shape)
-#         print(distance_map.shape)
         world_coordinates = ros + rds.reshape(NV, num_rays, self.n_coarse, -1)[...,0,:].squeeze() * distance_map
         depth_map = depth_from_world(world_coordinates, cam2world)
 
@@ -410,9 +391,6 @@ class AdaptiveVolumeRenderer(nn.Module):
         super().__init__()
         self.epsilon = epsilon
         self.n_coarse = n_coarse
-        # self.n_fine = n_fine
-        # self.n_fine_depth = n_fine_depth
-        # self.depth_std = depth_std
         self.white_back = white_back
 
         self.n_feature_channels = num_feature_channels
@@ -506,20 +484,16 @@ class AdaptiveVolumeRenderer(nn.Module):
         # Use the function sample_points_along_rays.
         # print("start")
         # a = time.time()
-#         print((world_coords[-1] - ros) / rds)
         distance = ((world_coords[-1][...,0] - ros[...,0]) / rds[...,0]).unsqueeze(2)
 
         pts, z_vals = batch_sample_points_along_rays(distance - self.epsilon,
                                                      distance + self.epsilon, 
                                                      self.n_coarse, ros, rds, device=xy_pix.device) # pts has shape (NV, num_rays, 3)
-#         print(f'z values: {z_vals.min().detach().cpu().numpy()},{z_vals.max().detach().cpu().numpy()}')
         # print("end", time.time() - a)
 
 
         rds = rds.unsqueeze(2).expand(NV, num_rays, self.n_coarse, -1)
-#         print(f'pts shape {pts.shape}')
-#         print(pts[0][528][0])
-#         print(f'rds shape {rds.shape}')
+
         # 
 
         # Input view directions
@@ -530,22 +504,8 @@ class AdaptiveVolumeRenderer(nn.Module):
         sigma = sigma_rad[...,3].reshape(NV, num_rays, self.n_coarse, 1)
         rad = sigma_rad[...,:3].reshape(NV, num_rays, self.n_coarse, 3)
 
-
-        # Reshape sigma and rad back to (NV, num_rays, self.n_samples, -1)
-        
-#         print(f'sigma: {sigma.min().detach().cpu().numpy()},{sigma.max().detach().cpu().numpy()}')
-#         print(f'rad: {rad.min().detach().cpu().numpy()},{rad.max().detach().cpu().numpy()}')
-
-        # print(f'z_vals has shape {z_vals.shape}')
-        # print(f'sigma has shape {sigma.shape}')
         # Compute pixel colors, depths, and weights via the volume integral.
         rgb, distance_map, weights = batch_volume_integral(z_vals, sigma, rad)
-        
-#         print(f'rgb: {rgb.min().detach().cpu().numpy()},{rgb.max().detach().cpu().numpy()}')
-#         print(f'depth_map: {depth_map.min().detach().cpu().numpy()},{depth_map.max().detach().cpu().numpy()}')
-#         print(f'weights: {weights.min().detach().cpu().numpy()},{weights.max().detach().cpu().numpy()}')
-
-
 
         if self.white_back:
             accum = weights.sum(dim=-2)
@@ -554,8 +514,6 @@ class AdaptiveVolumeRenderer(nn.Module):
         # Re-calculate depth map since rds now does not have z=1
         world_coordinates = ros + rds.reshape(NV, num_rays, self.n_coarse, -1)[...,0,:].squeeze() * distance_map
         depth_map = depth_from_world(world_coordinates, cam2world)
-#         print(distance_map[0].max().detach().cpu().numpy(),distance_map[0].min().detach().cpu().numpy())
-#         print(depth_map[0].max().detach().cpu().numpy(),depth_map[0].min().detach().cpu().numpy())
 
         return rgb, depth_map
 
@@ -568,9 +526,5 @@ class AdaptiveVolumeRenderer(nn.Module):
             n_coarse=conf.get_int("n_coarse", 16),
             # near=conf.get_float("near", 1.0),
             # far=conf.get_float("far", 2.5),
-            # n_coarse=conf.get_int("n_coarse", 32),
-            # n_fine=conf.get_int("n_fine", 16),
-            # n_fine_depth=conf.get_int("n_fine_depth", 8),
-            # depth_std=conf.get_float("depth_std", 0.01),
             white_back=conf.get_float("white_back", white_back),
         )
