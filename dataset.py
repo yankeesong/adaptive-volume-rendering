@@ -1,5 +1,4 @@
 from utils import *
-from glob import glob
 
 # def parse_rgb(hdf5_dataset):
 #     s = hdf5_dataset[...].tobytes()
@@ -202,20 +201,24 @@ class SceneInstanceDataset():
         else:
             self.param_paths = []
 
-        # Filter out bad images
-        idcs = []
-        for i in range(len(self.pose_paths)):
-            if torch.from_numpy(load_pose(self.pose_paths[i]))[2,3]>0:
-                idcs.append(i)
-        self.color_paths = pick(self.color_paths, idcs)
-        self.pose_paths = pick(self.pose_paths, idcs)
-        self.param_paths = pick(self.param_paths, idcs)
+
         
         if specific_observation_idcs is not None:
             self.color_paths = pick(self.color_paths, specific_observation_idcs)
             self.pose_paths = pick(self.pose_paths, specific_observation_idcs)
             self.param_paths = pick(self.param_paths, specific_observation_idcs)
-        elif num_images != -1:
+        # Filter out bad images
+        idcs = []
+        for i in range(len(self.pose_paths)):
+            if torch.from_numpy(load_pose(self.pose_paths[i]))[2,3]>0:
+                idcs.append(i)
+#         print(f'good {len(idcs)} poses')
+#         print(f'total {len(self.color_paths)} colors')
+#         print(instance_dir)
+        self.color_paths = pick(self.color_paths, idcs)
+        self.pose_paths = pick(self.pose_paths, idcs)
+        self.param_paths = pick(self.param_paths, idcs)
+        if specific_observation_idcs is None and num_images != -1:
             idcs = np.linspace(0, stop=len(self.color_paths), num=num_images, endpoint=False, dtype=int)
             self.color_paths = pick(self.color_paths, idcs)
             self.pose_paths = pick(self.pose_paths, idcs)
@@ -285,6 +288,7 @@ class SceneClassDataset(torch.utils.data.Dataset):
         self.instance_dirs = sorted(glob(os.path.join(root_dir, "*/")))
 
         assert (len(self.instance_dirs) != 0), "No objects in the data directory"
+        
 
         if max_num_instances != -1:
             self.instance_dirs = self.instance_dirs[:max_num_instances]

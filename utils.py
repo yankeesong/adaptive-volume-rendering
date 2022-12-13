@@ -24,6 +24,7 @@ from einops import rearrange, repeat
 
 from dotmap import DotMap
 from pyhocon import ConfigFactory
+from glob import glob
 from skimage.transform import resize
 
 def to_gpu(ob):
@@ -273,8 +274,89 @@ def depth_from_world(world_coords, cam2world):
     points_hom = points_hom.permute(0, 2, 1)
 
     points_cam = torch.inverse(cam2world).bmm(points_hom)  # (batch, 4, num_samples)
-    depth = points_cam[:, 2, :][:, :, None]  # (batch, num_samples, 1)
+    depth = -points_cam[:, 2, :][:, :, None]  # (batch, num_samples, 1)
     return depth
 
+# utils for generating videos
+def get_R(x,y,z):
+    camera_position = torch.Tensor([x,y,z]).reshape(1,3)
+    at = torch.Tensor([0,0,0]).reshape(1,3)
+    up = torch.Tensor([0,0,-1]).reshape(1,3)
 
-# Dataset utils
+    z_axis = F.normalize(at - camera_position, eps=1e-5)
+    x_axis = F.normalize(torch.cross(up, z_axis, dim=1), eps=1e-5)
+    y_axis = F.normalize(torch.cross(z_axis, x_axis, dim=1), eps=1e-5)
+    is_close = torch.isclose(x_axis, torch.tensor(0.0), atol=5e-3).all(
+        dim=1, keepdim=True
+    )
+    if is_close.any():
+        replacement = F.normalize(torch.cross(y_axis, z_axis, dim=1), eps=1e-5)
+        x_axis = torch.where(is_close, replacement, x_axis)
+    R = torch.cat((x_axis[:, None, :], y_axis[:, None, :], z_axis[:, None, :]), dim=1)
+    return R.transpose(1, 2)
+    
+def generate_video(model_input, num_frames, radius, net, model):
+    # Encode the model
+    model_input = to_gpu(model_input)
+    ground_truth = model_input["images"] # (NV, H*W, 3), values are between 0 and 1
+
+    NV, sl2, _ = ground_truth.shape
+    sl = int(np.sqrt(sl2))
+    idx = [0]
+
+    src_images = ground_truth[idx,...].reshape(-1,sl,sl,3).permute(0,3,1,2)
+    poses = model_input['cam2world'][idx,...]
+    focal = model_input['focal'][idx,...]
+    c = model_input['c'][idx,...]
+    intrinsics = model_input['intrinsics'][idx,...]
+    net.encode(src_images, poses, focal, c)
+    
+    # Generate a round of camera views
+    angles = torch.linspace(0,2*np.pi,num_frames)
+    cam2world = []
+    for i in range(num_frames):
+        angle = angles[i]
+        tx = radius * np.sin(angle)
+        ty = radius * np.cos(angle)
+        tz = 0.4
+        R = get_R(tx,ty,tz)
+        c2w = np.zeros((4,4))
+        c2w[:3,:3] = R
+        c2w[0,3] = tx
+        c2w[1,3] = ty
+        c2w[2,3] = tz
+        c2w[3,3] = 1
+        c2w = torch.Tensor(c2w).float() @ torch.diag(torch.tensor([1, -1, -1, 1], dtype=torch.float32))
+        cam2world.append(c2w)
+                                                  
+                                      
+    
+    # Render out images
+    x_pix = get_opencv_pixel_coordinates(sl, sl)
+    x_pix = rearrange(x_pix, 'i j c -> (i j) c')
+    with torch.no_grad():
+        frames = []
+        for i in range(len(cam2world)):
+            model_input = {'cam2world': cam2world[i].reshape(1,4,4), 'intrinsics': intrinsics, 
+                        'focal':focal,'c':c,'x_pix': x_pix.reshape(1,-1,2)}
+            model_input = to_gpu(model_input)
+            model_output = model(model_input)
+            img, depth = model_output
+            img = img[0].reshape(sl, sl, 3).cpu().numpy()
+            img *= 255
+            img = np.clip(img, 0, 255).astype(np.uint8)
+            frames.append(img)
+    return frames
+
+def calculate_psnr(rgb, gt):
+    rgb = rgb.squeeze().detach().cpu().numpy()
+    rgb = (rgb/ 2.) + 0.5
+    rgb = np.clip(rgb, a_min=0., a_max=1.)
+    
+    gt = gt.squeeze().detach().cpu().numpy()
+    gt = (gt / 2.) + 0.5
+    
+    ssim = skimage.measure.compare_ssim(rgb, gt, multichannel=True, data_range=1)
+    psnr = skimage.measure.compare_psnr(rgb, gt, data_range=1)
+
+    return psnr, ssim

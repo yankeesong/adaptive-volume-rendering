@@ -1,4 +1,5 @@
 from utils import *
+from dataset import *
 
 def fit(
     net: nn.Module,
@@ -71,6 +72,7 @@ def fit(
         # It would be boring otherwise!
         if not step % steps_til_summary:
             print(f"Step {step}: loss = {float(loss.detach().cpu()):.5f}")
+            print(f"car number {model_input['idx'][0]}")
 #             print("Min depth %0.6f, max depth %0.6f" %
 #                           (model_output[1].min().detach().cpu().numpy(), model_output[1].max().detach().cpu().numpy()))
 #             print("Min color %0.6f, max color %0.6f" %
@@ -114,3 +116,52 @@ def plot_output_ground_truth(model_output, ground_truth, resolution):
         axes[0, i].set_axis_off()
 
     plt.show()
+    
+def get_psnr(net, rf_and_renderer, val_dir, n_val, sl, specific_observation_idcs):
+    obj_dirs = sorted(glob(os.path.join(val_dir, "*/")))
+
+    assert (len(obj_dirs) != 0), "No objects in the data directory"
+
+    obj_dirs = obj_dirs[:n_val]
+    
+    psnrs = []
+    ssims = []
+    
+    for idx, dir in enumerate(obj_dirs):
+        print(f'object number {idx}')
+        # Encode
+        source_data = SceneInstanceDataset(instance_idx=idx,
+                                               instance_dir=dir,
+                                               specific_observation_idcs=[64],
+                                               img_sidelength=sl,
+                                               num_images=-1)
+        model_input = to_gpu(source_data[0])
+        src_images = model_input['images'].reshape(-1,sl,sl,3).permute(0,3,1,2)
+        poses = model_input['cam2world'].unsqueeze(0)
+        focal = model_input['focal'].unsqueeze(0)
+        c = model_input['c'].unsqueeze(0)
+        intrinsics = model_input['intrinsics'].unsqueeze(0)
+        net.encode(src_images, poses, focal, c)
+        
+        # Calculation
+        obj_data = SceneInstanceDataset(instance_idx=idx,
+                                               instance_dir=dir,
+                                               specific_observation_idcs=None,
+                                               img_sidelength=sl,
+                                               num_images=-1)
+        counter = 0
+        total_psnr = 0
+        total_ssim = 0
+        with torch.no_grad():
+            for mi in obj_data:
+                counter += 1
+                mi = to_gpu(mi)
+                for key in mi:
+                    mi[key] = mi[key].unsqueeze(0)
+                mo = rf_and_renderer(mi)
+                psnr, ssim = calculate_psnr(mo[0][0],mi['images'][0])
+                total_psnr += psnr
+                total_ssim += ssim
+            psnrs.append(total_psnr/counter)
+            ssims.append(total_ssim/counter)
+    return np.mean(psnr), np.mean(ssim)

@@ -80,6 +80,7 @@ class NewPixelNeRFNet(torch.nn.Module):
 
         self.latent_size = self.encoder.latent_size
         self.mlp_coarse = make_mlp(conf["mlp_coarse"], d_in, d_latent, d_out=d_out)
+#         self.mlp_sigma = make_mlp(conf["mlp_sigma"], d_in, d_latent, d_out=1)
         self.mlp_fine = make_mlp(
             conf["mlp_fine"], d_in, d_latent, d_out=d_out, allow_empty=True
         )
@@ -267,12 +268,19 @@ class NewPixelNeRFNet(torch.nn.Module):
                     combine_index=combine_index,
                     dim_size=dim_size,
                 )
+#             mlp_sigma_output = self.mlp_sigma(
+#                     mlp_input,
+#                     combine_inner_dims=(self.num_views_per_obj, B),
+#                     combine_index=combine_index,
+#                     dim_size=dim_size,
+#                 )
 
             # Interpret the output
             mlp_output = mlp_output.reshape(-1, B, self.d_out)
 
             rgb = mlp_output[..., :3]
             sigma = mlp_output[..., 3:4]
+#             sigma = mlp_sigma_output.reshape(-1, B, 1)
 
             output_list = [torch.sigmoid(rgb), torch.relu(sigma)]
             output = torch.cat(output_list, dim=-1)
