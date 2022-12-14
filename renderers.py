@@ -160,6 +160,8 @@ def batch_volume_integral(
     radiances: torch.tensor
 ) -> Tuple[torch.tensor, torch.tensor]:
 
+    if sigmas.shape[0] == 1 and  z_vals.shape[0] != 1:  # Ugly thing
+        z_vals = z_vals.unsqueeze(0)
     # Compute the deltas in depth between the points.
     dists = torch.cat([
         z_vals[..., 1:] - z_vals[..., :-1], 
@@ -170,6 +172,7 @@ def batch_volume_integral(
     # Compute the alpha values from the densities and the dists.
     # Tip: use torch.einsum for a convenient way of multiplying the correct 
     # dimensions of the sigmas and the dists.
+
     alpha = 1.- torch.exp(-torch.einsum('brzs, brz -> brzs', sigmas, dists))
     
 
