@@ -16,6 +16,7 @@ import imageio
 import skimage
 import io
 import warnings
+import time
 
 import math
 import collections
@@ -27,6 +28,31 @@ from pyhocon import ConfigFactory
 from glob import glob
 from skimage.transform import resize
 
+# Indexing functions
+def batched_index_select_nd(t, inds):
+    """
+    Index select on dim 1 of a n-dimensional batched tensor. From PixelNeRF
+    :param t (batch, n, ...)
+    :param inds (batch, k)
+    :return (batch, k, ...)
+    """
+    return t.gather(
+        1, inds[(...,) + (None,) * (len(t.shape) - 2)].expand(-1, -1, *t.shape[2:])
+    )
+
+def batched_index_select_nd_second(t, inds):
+    """
+    Index select on dim 2 of a >=2D multi-batched tensor. inds assumed
+    to have all batch dimensions except one data dimension 'n'
+    :param t (batch, n, m, ...)
+    :param inds (batch, n, k)
+    :return (batch, n, k, ...)
+    """
+    return t.gather(
+        2, inds[(...,) + (None,) * (len(t.shape) - 3)].expand(-1, -1, -1, *t.shape[3:])
+    )
+
+# NN functions
 def to_gpu(ob):
     if isinstance(ob, collections.Mapping):
         return {k: to_gpu(v) for k, v in ob.items()}
@@ -44,10 +70,35 @@ def init_weights(m):
     if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv2d):
         torch.nn.init.kaiming_normal_(m.weight)
 
+def init_recurrent_weights(self):
+    for m in self.modules():
+        if type(m) in [nn.GRU, nn.LSTM, nn.RNN]:
+            for name, param in m.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.kaiming_normal_(param.data)
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param.data)
+                elif 'bias' in name:
+                    param.data.fill_(0)
 
 
+def lstm_forget_gate_init(lstm_layer):
+    for name, parameter in lstm_layer.named_parameters():
+        if not "bias" in name: continue
+        n = parameter.size(0)
+        start, end = n // 4, n // 2
+        parameter.data[start:end].fill_(1.)
 
-# Multiview helper functions
+
+def clip_grad_norm_hook(x, max_norm=10):
+    total_norm = x.norm()
+    total_norm = total_norm ** (1 / 2.)
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        return x * clip_coef
+
+
+# Geometry
 def homogenize_points(points: torch.Tensor):
     """Appends a "1" to the coordinates of a (batch of) points of dimension DIM.
 
@@ -136,11 +187,6 @@ def transform_rigid(xyz_hom: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
         xyz_trans: transformed points.
     """ 
     return torch.einsum('...ij,...kj->...ki', T, xyz_hom)
-
-
-def get_unnormalized_cam_ray_directions(xy_pix:torch.Tensor,
-                                        intrinsics:torch.Tensor) -> torch.Tensor:
-    return unproject(xy_pix, -torch.ones_like(xy_pix[..., :1], device=xy_pix.device),  intrinsics=intrinsics)  
        
 def get_normalized_cam_ray_directions(xy_pix:torch.Tensor,
                                         intrinsics:torch.Tensor) -> torch.Tensor:
@@ -165,8 +211,8 @@ def get_world_rays(xy_pix: torch.Tensor,
     rd_world_hom = transform_cam2world(rd_cam_hom, cam2world)
 
     # Tile the ray origins to have the same shape as the ray directions.
-    # Currently, ray origins have shape (batch, 3), while ray directions have shape
-    cam_origin_world = repeat(cam_origin_world, 'b ch -> b num_rays ch', num_rays=ray_dirs_cam.shape[1])
+    # Currently, ray origins have shape (SB, NV, 3), while ray directions have shape (SB, NV, num_rays, 3)
+    cam_origin_world = repeat(cam_origin_world, 'b nv ch -> b nv num_rays ch', num_rays=ray_dirs_cam.shape[2])
 
     # Return tuple of cam_origins, ray_world_directions
     return cam_origin_world, rd_world_hom[..., :3]
@@ -191,91 +237,10 @@ def get_opencv_pixel_coordinates(
     xy_pix = torch.stack([i.float(), j.float()], dim=-1).permute(1, 0, 2)
     return xy_pix
 
-# functions from SRN
-def parse_intrinsics(intrinsics):
-    # intrinsics = intrinsics.cuda()
-
-    fx = intrinsics[:, 0, 0]
-    fy = intrinsics[:, 1, 1]
-    cx = intrinsics[:, 0, 2]
-    cy = intrinsics[:, 1, 2]
-    return fx, fy, cx, cy
-
-
-def expand_as(x, y):
-    if len(x.shape) == len(y.shape):
-        return x
-
-    for i in range(len(y.shape) - len(x.shape)):
-        x = x.unsqueeze(-1)
-
-    return x
-
-
-def lift(x, y, z, intrinsics, homogeneous=False):
-    '''
-
-    :param self:
-    :param x: Shape (batch_size, num_points)
-    :param y:
-    :param z:
-    :param intrinsics:
-    :return:
-    '''
-    fx, fy, cx, cy = parse_intrinsics(intrinsics)
-
-    x_lift = (x - expand_as(cx, x)) / expand_as(fx, x) * z
-    y_lift = (y - expand_as(cy, y)) / expand_as(fy, y) * z
-
-    if homogeneous:
-        return torch.stack((x_lift, y_lift, z, torch.ones_like(z).to(z.device)), dim=-1)
-    else:
-        return torch.stack((x_lift, y_lift, z), dim=-1)
-
-def world_from_xy_depth(xy, depth, cam2world, intrinsics):
-    '''Translates meshgrid of xy pixel coordinates plus depth to  world coordinates.
-    '''
-    batch_size, _, _ = cam2world.shape
-
-    x_cam = xy[:, :, 0].view(batch_size, -1)
-    y_cam = xy[:, :, 1].view(batch_size, -1)
-    z_cam = depth.view(batch_size, -1)
-
-    pixel_points_cam = lift(x_cam, y_cam, z_cam, intrinsics=intrinsics, homogeneous=True)  # (batch_size, -1, 4)
-
-    # permute for batch matrix product
-    pixel_points_cam = pixel_points_cam.permute(0, 2, 1)
-
-    world_coords = torch.bmm(cam2world, pixel_points_cam).permute(0, 2, 1)[:, :, :3]  # (batch_size, -1, 3)
-
-    return world_coords
-
-def get_ray_directions(xy, cam2world, intrinsics):
-    '''Translates meshgrid of xy pixel coordinates to normalized directions of rays through these pixels.
-    '''
-    batch_size, num_samples, _ = xy.shape
-
-    z_cam = torch.ones((batch_size, num_samples)).to(xy.device)
-    pixel_points = world_from_xy_depth(xy, z_cam, intrinsics=intrinsics, cam2world=cam2world)  # (batch, num_samples, 3)
-
-    cam_pos = cam2world[:, :3, 3]
-    ray_dirs = pixel_points - cam_pos[:, None, :]  # (batch, num_samples, 3)
-    ray_dirs = F.normalize(ray_dirs, dim=2)
-    return ray_dirs
-
-
 def depth_from_world(world_coords, cam2world):
-    batch_size, num_samples, _ = world_coords.shape
-
-    points_hom = torch.cat((world_coords, torch.ones((batch_size, num_samples, 1)).to(world_coords.device)),
-                           dim=2)  # (batch, num_samples, 4)
-
-    # permute for bmm
-    points_hom = points_hom.permute(0, 2, 1)
-
-    points_cam = torch.inverse(cam2world).bmm(points_hom)  # (batch, 4, num_samples)
-    depth = -points_cam[:, 2, :][:, :, None]  # (batch, num_samples, 1)
-    return depth
+    points_hom = homogenize_points(world_coords)  # (batch, NV, num_samples, 4)
+    points_cam = transform_world2cam(points_hom,cam2world)  # (batch, NV, num_samples, 4)
+    return -points_cam[...,2]  # (batch, NV, num_samples, 1)
 
 # utils for generating videos
 def get_R(x,y,z):
@@ -329,8 +294,6 @@ def generate_video(model_input, num_frames, radius, net, model):
         c2w = torch.Tensor(c2w).float() @ torch.diag(torch.tensor([1, -1, -1, 1], dtype=torch.float32))
         cam2world.append(c2w)
                                                   
-                                      
-    
     # Render out images
     x_pix = get_opencv_pixel_coordinates(sl, sl)
     x_pix = rearrange(x_pix, 'i j c -> (i j) c')
@@ -348,6 +311,7 @@ def generate_video(model_input, num_frames, radius, net, model):
             frames.append(img)
     return frames
 
+# Loss functions
 def calculate_psnr(rgb, gt):
     rgb = rgb.squeeze().detach().cpu().numpy()
     rgb = (rgb/ 2.) + 0.5

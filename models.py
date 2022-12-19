@@ -341,19 +341,17 @@ class RadFieldAndRenderer(nn.Module):
         self.rf = rf
         self.renderer = renderer
 
-    def forward(self, model_input):
-        xy_pix = model_input['x_pix']
-        intrinsics = model_input['intrinsics']
-        c2w = model_input['cam2world']
-
-        #print(f'pixels shape: {xy_pix.shape}')
+    def forward(self, model_input, num_rays = -1):
+        xy_pix = model_input['x_pix'] # (SB, NV, num_rays, 2)
+        intrinsics = model_input['intrinsics'] # (SB, NV, 3, 3)
+        c2w = model_input['cam2world'] # (SB, NV, 4, 4)
 
         rgb, depth = self.renderer(
                               c2w,
                               intrinsics,
                               xy_pix, 
                               self.rf
-                              )
+                              ) # (SB, NV, num_rays, 3/1)
         
         return rgb, depth
     
@@ -384,15 +382,5 @@ class RadFieldAndRenderer(nn.Module):
         Helper for saving weights according to argparse arguments
         :param opt_init if true, saves from init checkpoint instead of usual
         """
-        from shutil import copyfile
-
-        # ckpt_name = "pixel_nerf_init" if opt_init else "pixel_nerf_latest"
-        # backup_name = "pixel_nerf_init_backup" if opt_init else "pixel_nerf_backup"
-
-        # ckpt_path = osp.join(args.checkpoints_path, args.name, ckpt_name)
-        # ckpt_backup_path = osp.join(args.checkpoints_path, args.name, backup_name)
-
-        # if osp.exists(ckpt_path):
-        #     copyfile(ckpt_path, ckpt_backup_path)
         torch.save(self.state_dict(), model_path)
         return self

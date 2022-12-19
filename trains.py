@@ -4,87 +4,101 @@ from dataset import *
 def fit(
     net: nn.Module,
     model: nn.Module,
-    data_loader,
+    train_dset,
+    val_dset,
+    batch_size,
+    ray_batch_size,
     loss_fn,
-    resolution: Tuple,
     optimizer,
-    plotting_function = None,
-    steps_til_summary = 500,
-    total_steps=2001
+    epochs,
+    steps_til_summary,
    ):
+    (print_steps, vis_steps, val_steps, save_epochs) = steps_til_summary
+    train_dataloader = DataLoader(train_dset,
+                                      batch_size=batch_size,
+                                      shuffle=True,
+                                      drop_last=True,
+                                      collate_fn=train_dset.collate_fn
+                                      )
 
-    losses = []
-    data_iterator = iter(data_loader)
-    for step in range(total_steps):
-        # Get the next batch of data and move it to the GPU
-        try:
-            model_input = next(data_iterator)
-        except StopIteration:
-            data_iterator = iter(data_loader)
-            model_input = next(data_iterator)
+    val_dataloader = DataLoader(val_dset,
+                                      batch_size=min(batch_size,16),
+                                      shuffle=True,
+                                      drop_last=True,
+                                      collate_fn=val_dset.collate_fn
+                                      )
 
-        model_input = to_gpu(model_input)
-        ground_truth = model_input["images"] # (NV, H*W, 3), values are between 0 and 1
+    for e in range(epochs):
+        step = 0
+        for all_input in train_dataloader:
+            all_input = to_gpu(all_input)
+            all_images = all_input["images"] # (SB, NV, H*W, 3), values are between 0 and 1
 
-        NV, sl2, _ = ground_truth.shape
-        NS = 1 # Number of source views, san only handle one now
-        sl = int(np.sqrt(sl2))
+            SB, NV, sl2, _ = all_images.shape
+            NS = 1 # Number of source views, can only handle one now
+            sl = int(np.sqrt(sl2))
 
-        # Extract source images (randomly determine)
-        src_idx = to_gpu(np.random.choice(NV, NS, replace=False))
-        
+            # Sample source indices
+            src_idx = to_gpu(torch.randint(0, NV, (SB, NS)))
 
+            # Encode
+            src_images = batched_index_select_nd(all_images,src_idx).reshape(SB,NS,sl,sl,3).permute(0,1,4,2,3) # (SB, NS, 3, sl, sl)
+            poses = batched_index_select_nd(all_input['cam2world'],src_idx) # (SB, NS, 4, 4)
+            focal = batched_index_select_nd(all_input['focal'],src_idx)[0,0] # scalar
+            c = batched_index_select_nd(all_input['c'],src_idx)[0,0,:] # (2)
+            net.encode(src_images, poses, focal, c)
 
-        # Encode
-        # :param images (NS, 3, H, W)
-        # NS is number of source views, now can only deal with 1
-        # :param poses (NS, 4, 4)
-        # :param focal focal length () or (2) or (NS) or (NS, 2) [fx, fy]
-        # :param z_bounds ignored argument (used in the past)
-        # :param c principal point None or () or (2) or (NS) or (NS, 2) [cx, cy],
-        # default is center of image
-        src_images = ground_truth[src_idx,...].reshape(-1,sl,sl,3).permute(0,3,1,2)
-        #print(f'source image has size {src_images.shape}')
-        poses = model_input['cam2world'][src_idx,...]
-        #print(f'poses has size {poses.shape}')
-        focal = model_input['focal'][src_idx,...]
-        c = model_input['c'][src_idx,...]
-        
-        net.encode(src_images, poses, focal, c)
+            # Sample rays
+            rays_idx = torch.randint(0, sl2, (SB, NV, ray_batch_size))
+            model_input = {}
+            model_input['x_pix'] = batched_index_select_nd_second(all_input['x_pix'], rays_idx)
+            model_input['cam2world'] = all_input['cam2world']
+            model_input['intrinsics'] = all_input['intrinsics']
+            ground_truth = 0.5 * batched_index_select_nd_second(all_input['images'], rays_idx) + 0.5
 
+            # Compute the MLP output for the given input data and compute the loss
+            model_output = model(model_input)
 
-        
+            # Implement a simple mean-squared-error loss
+            loss = loss_fn(model_output, ground_truth)
 
-        # Compute the MLP output for the given input data and compute the loss
-        model_output = model(model_input)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()         
 
-        # Implement a simple mean-squared-error loss between the 
-        loss = loss_fn(model_output, ground_truth) # Note: loss now takes "model" as input.
+            # Every so often, we want to show what our model has learned.
+            # It would be boring otherwise!
+            if not step % print_steps:
+                print(f"Epoch {e} Step {step}: loss = {float(loss.detach().cpu()):.5f}")
+    #             print("Min depth %0.6f, max depth %0.6f" %
+    #                           (model_output[1].min().detach().cpu().numpy(), model_output[1].max().detach().cpu().numpy()))
+    #             print("Min color %0.6f, max color %0.6f" %
+    #                           (model_output[0].min().detach().cpu().numpy(), model_output[0].max().detach().cpu().numpy()))
+                
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            if not step % vis_steps: # visualization
+                model.eval()
+                vis_idx =  to_gpu(torch.tensor([0]).expand(SB, 1))
+                dummy = batched_index_select_nd(all_images,vis_idx)
+                vis_gt = 0.5 * batched_index_select_nd(all_images,vis_idx) + 0.5
+                all_input['x_pix'] = batched_index_select_nd(all_input['x_pix'], vis_idx)
+                all_input['cam2world'] = batched_index_select_nd(all_input['cam2world'], vis_idx)
+                all_input['intrinsics'] = batched_index_select_nd(all_input['intrinsics'], vis_idx)
 
-        # Accumulate the losses so that we can plot them later
-        # losses.append(loss.detach().cpu().numpy())            
+                with torch.no_grad():
+                    vis_output = model(all_input)
+                    plot_output_ground_truth(vis_output, vis_gt, (sl,sl,3), src_idx)
+                model.train()
 
-        # Every so often, we want to show what our model has learned.
-        # It would be boring otherwise!
-        if not step % steps_til_summary:
-            print(f"Step {step}: loss = {float(loss.detach().cpu()):.5f}")
-            print(f"car number {model_input['idx'][0]}")
-#             print("Min depth %0.6f, max depth %0.6f" %
-#                           (model_output[1].min().detach().cpu().numpy(), model_output[1].max().detach().cpu().numpy()))
-#             print("Min color %0.6f, max color %0.6f" %
-#                           (model_output[0].min().detach().cpu().numpy(), model_output[0].max().detach().cpu().numpy()))
-            if src_idx == 0:
-                print(f'same view dir as src')
-
-            if plotting_function is not None: # Note: we now call the "plotting function" instead of hard-coding the plotting here.
-                plotting_function(model_output, ground_truth, resolution)
-
+            if not step % val_steps:
+                pass # validation
+            
+            step += 1
+        if not (e+1) % save_epochs:
+            pass # save model
     return model_output
 
+# Loss functions
 def mse_loss(mlp_out, gt):
     img, depth = mlp_out
     return ((img - gt)**2).mean()
@@ -95,28 +109,35 @@ def mse_regularization_loss(mlp_out, gt, near=0.5, far=2.0):
     penalty = (torch.min(depth-near, torch.zeros_like(depth)) ** 2) + (torch.max(depth-far, torch.zeros_like(depth)) ** 2)
     return ((img - gt)**2).mean() + torch.mean(penalty) * 10000
 
-def plot_output_ground_truth(model_output, ground_truth, resolution):
-    img, depth = model_output
+# Plotting functions
+def plot_output_ground_truth(vis_output, vis_gt, resolution, src_idx):
+    vis_img, vis_depth = vis_output
 
-    img = img[0]
-    depth = depth[0]
-    gt = ground_truth[0]
+    SB = vis_img.shape[0]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6), squeeze=False)
-    axes[0, 0].imshow(img.cpu().view(*resolution).detach().numpy())
-    axes[0, 0].set_title("Trained MLP")
-    axes[0, 1].imshow(gt.cpu().view(*resolution).detach().numpy())
-    axes[0, 1].set_title("Ground Truth")
-    
-    depth = depth.cpu().view(*resolution[:2]).detach().numpy()
-    axes[0, 2].imshow(depth, cmap='Greys')
-    axes[0, 2].set_title("Depth")
-    
-    for i in range(3):
-        axes[0, i].set_axis_off()
+    fig, axes = plt.subplots(SB, 3, figsize=(18, 6*SB), squeeze=False)
 
+    for sb in range(SB):
+        img = vis_img[sb,0]
+        depth = vis_depth[sb,0]
+        gt = vis_gt[sb,0]
+
+        axes[sb, 0].imshow(img.cpu().view(*resolution).detach().numpy())
+        if src_idx[sb,0] == 0:
+            title = "Trained MLP (same view as src)"
+        else:
+            title = "Trained MLP"
+        axes[sb, 0].set_title(title)
+        axes[sb, 1].imshow(gt.cpu().view(*resolution).detach().numpy())
+        axes[sb, 1].set_title("Ground Truth")
+        axes[sb, 2].imshow(depth.cpu().view(*resolution[:2]).detach().numpy(), cmap='Greys')
+        axes[sb, 2].set_title("Depth")
+        
+        for j in range(3):
+            axes[sb,j].set_axis_off()
     plt.show()
-    
+
+# Validation functions
 def get_psnr(net, rf_and_renderer, val_dir, n_val, sl, specific_observation_idcs):
     obj_dirs = sorted(glob(os.path.join(val_dir, "*/")))
 

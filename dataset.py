@@ -110,17 +110,14 @@ class SceneInstanceDataset():
         intrinsics = torch.Tensor(intrinsics).float()
 
         img = imageio.imread(self.color_paths[idx])[:, :, :3]
-        rgb = skimage.img_as_float32(img)
+        ops = [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),]
+        
 
-        x_pix = get_opencv_pixel_coordinates(*rgb.shape[:2])
+        x_pix = get_opencv_pixel_coordinates(*img.shape[:2])
 
 
-        if self.img_sidelength is not None and rgb.shape[0] != self.img_sidelength:
-            rgb = resize(rgb, 
-                            (self.img_sidelength, self.img_sidelength), 
-                            anti_aliasing=False,
-                            order=0)
-            rgb = torch.from_numpy(rgb)
+        if self.img_sidelength is not None and img.shape[0] != self.img_sidelength:
+            ops.append(transforms.Resize(self.img_sidelength))
             x_pix = resize(x_pix, 
                             (self.img_sidelength, self.img_sidelength), 
                             anti_aliasing=False,
@@ -128,7 +125,8 @@ class SceneInstanceDataset():
             
         x_pix = torch.from_numpy(rearrange(x_pix, 'i j c -> (i j) c'))
 
-        rgb = rearrange(rgb, 'i j c -> (i j) c')
+        op = transforms.Compose(ops)
+        rgb = op(img).permute(1,2,0).reshape(self.img_sidelength*self.img_sidelength,-1)
 
         c2w = torch.from_numpy(load_pose(self.pose_paths[idx])) @ torch.diag(torch.tensor([1, -1, -1, 1], dtype=torch.float32))
 
@@ -195,11 +193,8 @@ class SceneClassDataset(torch.utils.data.Dataset):
     def collate_fn(self,batch_list):
         batch_num = len(batch_list)
         all_dict = {}
-        # key_list = ['focal','intrinsics','c','idx']
         for key in batch_list[0][0].keys():
             temp = torch.stack([torch.stack([observation[key] for observation in scene]) for scene in batch_list ])
-            # if key in key_list:
-            #     temp = temp[:,0,...].unsqueeze(1)
             if batch_num == 1:
                 temp = temp.squeeze(0)
             all_dict[key] = temp

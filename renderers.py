@@ -1,207 +1,80 @@
 from utils import *
-# import sys
-# #root_dir = "/Users/jameszli/desktop/MIT/6.S980/"  
-# #sys.path.insert(0, f"{root_dir}/scene-representation-networks/")
-# from geometry import *
-# from util import *
-# #from pytorch_prototyping import pytorch_prototyping
 
-import time
-def init_recurrent_weights(self):
-    for m in self.modules():
-        if type(m) in [nn.GRU, nn.LSTM, nn.RNN]:
-            for name, param in m.named_parameters():
-                if 'weight_ih' in name:
-                    nn.init.kaiming_normal_(param.data)
-                elif 'weight_hh' in name:
-                    nn.init.orthogonal_(param.data)
-                elif 'bias' in name:
-                    param.data.fill_(0)
-
-
-def lstm_forget_gate_init(lstm_layer):
-    for name, parameter in lstm_layer.named_parameters():
-        if not "bias" in name: continue
-        n = parameter.size(0)
-        start, end = n // 4, n // 2
-        parameter.data[start:end].fill_(1.)
-
-
-def clip_grad_norm_hook(x, max_norm=10):
-    total_norm = x.norm()
-    total_norm = total_norm ** (1 / 2.)
-    clip_coef = max_norm / (total_norm + 1e-6)
-    if clip_coef < 1:
-        return x * clip_coef
-
-class DepthSampler(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self,
-                xy,
-                depth,
-                cam2world,
-                intersection_net,
-                intrinsics):
-        self.logs = list()
-
-        batch_size, _, _ = cam2world.shape
-
-        intersections = world_from_xy_depth(xy=xy, depth=depth, cam2world=cam2world, intrinsics=intrinsics)
-
-        depth = depth_from_world(intersections, cam2world)
-
-        if self.training:
-            print(depth.min(), depth.max())
-
-        return intersections, depth
 
 def sample_points_along_rays(
-    near_depth: float,
-    far_depth: float,
+    near_depth, # (SB, NV, num_ways)
+    far_depth, # (SB, NV, num_ways)
     num_samples: int,
-    ray_origins: torch.Tensor,
-    ray_directions: torch.Tensor,
-    device: torch.device
+    ray_origins: torch.Tensor,  # (SB, NV, num_ways, 3)
+    ray_directions: torch.Tensor,  # (SB, NV, num_ways, 3)
+    device: torch.device,
+    infinity = -1
 ):
+    near_depth = torch.tensor(near_depth)
+    far_depth = torch.tensor(far_depth)
+    # near_depth and far_depth should have dim (SB, NV, num_rays)
+    if len(near_depth.shape) == 0:
+        near_depth = near_depth.expand_as(ray_origins[...,0])
+        far_depth = far_depth.expand_as(ray_origins[...,0])
+
     # Compute a linspace of num_samples depth values beetween near_depth and far_depth.
-    z_vals = torch.linspace(near_depth, far_depth - (far_depth-near_depth)/num_samples, num_samples, device=device)
+    steps = torch.arange(num_samples, dtype=torch.float32, device=device) / num_samples # n_coarse
+    z_vals = near_depth.unsqueeze(-1) + torch.einsum('bns,j->bnsj', far_depth-near_depth, steps)  # (SB, NV, num_rays, n_coarse)
+
+    if infinity != -1:
+        zz_vals = torch.cat([z_vals[..., 1:], 
+        torch.broadcast_to(torch.tensor([infinity]).to(z_vals.device), z_vals[...,:1].shape)
+        ], -1) 
+    else: 
+        zz_vals = z_vals # (SB, NV, num_rays, n_coarse)
 
     # Using the ray_origins, ray_directions, generate 3D points along
     # the camera rays according to the z_vals.
-    pts = ray_origins[...,None,:] + ray_directions[...,None,:] * z_vals[...,:,None]
-
-    return pts, z_vals
-
-def linspace(start: torch.Tensor, stop: torch.Tensor, num: int):
-    """
-    Creates a tensor of shape [num, *start.shape] whose values are evenly spaced from start to end, inclusive.
-    Replicates but the multi-dimensional bahaviour of numpy.linspace in PyTorch.
-    """
-    # create a tensor of 'num' steps from 0 to 1
-    steps = torch.arange(num, dtype=torch.float32, device=start.device) / (num - 1)
-    
-    # reshape the 'steps' tensor to [-1, *([1]*start.ndim)] to allow for broadcastings
-    # - using 'steps.reshape([-1, *([1]*start.ndim)])' would be nice here but torchscript
-    #   "cannot statically infer the expected size of a list in this contex", hence the code below
-    for i in range(start.ndim):
-        steps = steps.unsqueeze(-1)
-    
-    # the output starts at 'start' and increments until 'stop' in each dimension
-    out = start[None] + steps*(stop - start)[None]
-    
-    return out
-
-def batch_sample_points_along_rays(
-    near_depth: torch.Tensor,
-    far_depth: torch.Tensor,
-    num_samples: int,
-    ray_origins: torch.Tensor,
-    ray_directions: torch.Tensor,
-    device: torch.device
-):
-    # Compute a linspace of num_samples depth values beetween near_depth and far_depth.
-    z_vals = linspace(near_depth, far_depth - (far_depth-near_depth)/num_samples, num_samples)
-
-    z_vals = z_vals.permute(1, 2, 0, 3).squeeze()
-    zz_vals = torch.cat([z_vals[..., :-1], 
-    torch.broadcast_to(torch.Tensor([2.5]).to(z_vals.device), z_vals[...,:1].shape)
-    ], -1) 
-    
-
-    # Using the ray_origins, ray_directions, generate 3D points along
-    # the camera rays according to the z_vals.
-    pts = ray_origins[...,None,:] + ray_directions[...,None,:] * z_vals[...,:,None]
+    pts = ray_origins.unsqueeze(-2) + torch.einsum('bnsi,bnsj->bnsji', ray_directions, zz_vals)  # (SB, NV, num_rays, n_coarse, 3)
 
     return pts, zz_vals
 
 def volume_integral(
-    z_vals: torch.tensor,
-    sigmas: torch.tensor,
-    radiances: torch.tensor
+    z_vals: torch.tensor, # (SB, NV, num_rays, n_coarse)
+    sigmas: torch.tensor,  # (SB, NV, num_rays, n_coarse, 1)
+    radiances: torch.tensor  # (SB, NV, num_rays, n_coarse, 3)
 ) -> Tuple[torch.tensor, torch.tensor]:
 
     # Compute the deltas in depth between the points.
     dists = torch.cat([
         z_vals[..., 1:] - z_vals[..., :-1], 
         torch.broadcast_to(torch.Tensor([1e10]).to(z_vals.device), z_vals[...,:1].shape)
-        ], -1) 
+        ], -1) # (SB, NV, num_rays, n_coarse)
 
     # Compute the alpha values from the densities and the dists.
     # Tip: use torch.einsum for a convenient way of multiplying the correct 
     # dimensions of the sigmas and the dists.
-    alpha = 1.- torch.exp(-torch.einsum('brzs, z -> brzs', sigmas, dists))
+    alpha = 1.- torch.exp(-torch.einsum('bnrzs, bnrz -> bnrzs', sigmas, dists)) # (SB, NV, num_rays, n_coarse, 1)
 
     # Compute the Ts from the alpha values. Use torch.cumprod.
-    TTs = torch.cumprod(1.-alpha+1e-10, -2)
     
     Ts = torch.cat([
-        torch.broadcast_to(torch.Tensor([1]).to(TTs.device), TTs[...,:1].shape),
-        TTs[..., :-1],
-        ], -1) 
-
-    # Compute the weights from the Ts and the alphas.
-    weights = alpha * Ts
-    
-    # Compute the pixel color as the weighted sum of the radiance values.
-    rgb = torch.einsum('brzs, brzs -> brs', weights, radiances)
-
-    # Compute the depths as the weighted sum of z_vals.
-    # Tip: use torch.einsum for a convenient way of computing the weighted sum,
-    # without the need to reshape the z_vals.
-    depth_map = torch.einsum('brzs, z -> brs', weights, z_vals)
-
-    return rgb, depth_map, weights
-
-def batch_volume_integral(
-    z_vals: torch.tensor,
-    sigmas: torch.tensor,
-    radiances: torch.tensor
-) -> Tuple[torch.tensor, torch.tensor]:
-
-    if sigmas.shape[0] == 1 and  z_vals.shape[0] != 1:  # Ugly thing
-        z_vals = z_vals.unsqueeze(0)
-    # Compute the deltas in depth between the points.
-    dists = torch.cat([
-        z_vals[..., 1:] - z_vals[..., :-1], 
-        torch.broadcast_to(torch.Tensor([1e10]).to(z_vals.device), z_vals[...,:1].shape)
-        ], -1) 
-#     print(f'dists: {dists.min().detach().cpu().numpy()},{dists.max().detach().cpu().numpy()}')
-
-    # Compute the alpha values from the densities and the dists.
-    # Tip: use torch.einsum for a convenient way of multiplying the correct 
-    # dimensions of the sigmas and the dists.
-
-    alpha = 1.- torch.exp(-torch.einsum('brzs, brz -> brzs', sigmas, dists))
-    
-
-    # Compute the Ts from the alpha values. Use torch.cumprod.
-    TTs = torch.cumprod(1.-alpha+1e-10, -2)
-    
-    Ts = torch.cat([
-        torch.broadcast_to(torch.Tensor([1]).to(TTs.device), TTs[...,:1,:].shape),
-        TTs[..., :-1,:],
+        torch.broadcast_to(torch.Tensor([1]).to(alpha.device), alpha[...,:1,:].shape),
+        torch.cumprod(1.-alpha+1e-10, -2)[...,:-1,:],
         ], -2) 
 
     # Compute the weights from the Ts and the alphas.
-    weights = alpha * Ts
+    ind = 0
+    
+    weights = alpha * Ts # (SB, NV, num_rays, n_coarse, 1)
     
     # Compute the pixel color as the weighted sum of the radiance values.
-    rgb = torch.einsum('brzs, brzs -> brs', weights, radiances)
+    rgb = torch.einsum('bnrzs, bnrzs -> bnrs', weights, radiances) # (SB, NV, num_rays, 3)
 
     # Compute the depths as the weighted sum of z_vals.
     # Tip: use torch.einsum for a convenient way of computing the weighted sum,
     # without the need to reshape the z_vals.
-#     print(z_vals[0][528])
-
-    depth_map = torch.einsum('brzs, brz -> brs', weights, z_vals)
+    depth_map = torch.einsum('bnrzs, bnrz -> bnrs', weights, z_vals) # (SB, NV, num_rays, 1)
 
     return rgb, depth_map, weights
 
-
 class VolumeRenderer(nn.Module):
-    def __init__(self, near=0.8, far=1.8, n_coarse=32, n_fine=16, n_fine_depth=8, depth_std = 0.01, white_back=True):
+    def __init__(self, near, far, n_coarse, n_fine, n_fine_depth, depth_std, white_back=True):
         super().__init__()
         self.near = near
         self.far = far
@@ -224,14 +97,15 @@ class VolumeRenderer(nn.Module):
 
         Params:
             input_dict: Dictionary with keys 'cam2world', 'intrinsics', and 'x_pix'
-                here x_pix has size (B,2)
+                here x_pix has size (SB, NV, num_rays, 2)
             radiance_field: nn.Module instance of the radiance field we want to render. This should by default the PixelNeRF. 
                 Params: 
-                    xyz: points in space, with shape (SB,B,3)
+                    xyz: points in space, with shape (SB, NV, num_rays, 3)
                         SB is batch of objects
-                        B is batch of points (in rays)
+                        NV is num of views
+                        num_rays is batch of points (in rays)
                 Return:
-                    (SB, B, 4) of r g b sigma
+                    (SB, NV, num_rays, 4) of r g b sigma
 
         Returns:
             Tuple of rgb, depth_map
@@ -239,48 +113,34 @@ class VolumeRenderer(nn.Module):
             depth_map: for each pixel coordinate x_pix, the depth of the respective ray.
  
         """
-        NV, num_rays, _ = x_pix.shape  # _ should be 2, since each pixel coordinate has 2 inputs
+        SB, NV, num_rays, _ = x_pix.shape  # _ should be 2, since each pixel coordinate has 2 inputs
 
         # Compute the ray directions in world coordinates.
         # Use the function get_world_rays.
-        ros, rds = get_world_rays(x_pix, intrinsics, cam2world) # (NV, num_ways, 3)
-
-        z_scales = rds[...,2].unsqueeze(2) # (NV, num_ways, 1)
-
+        ros, rds = get_world_rays(x_pix, intrinsics, cam2world) # (SB, NV, num_ways, 3)
 
         # Generate the points along rays and their depth values
         # Use the function sample_points_along_rays.
         pts, z_vals = sample_points_along_rays(self.near, self.far, self.n_coarse, 
-                                                ros, rds, device=x_pix.device) # pts has shape (NV, num_rays, 3)
-        rds = rds.unsqueeze(2).expand(NV, num_rays, self.n_coarse, -1)
-
-        # 
-        pts = pts.reshape(1,-1,3)  # (1, NV*num_rays*self.n_coarse, 3)
-        rds = rds.reshape(1,-1,3)
-
-        # Input view directions
-        # (NV*num_ways, 3)
+                                                ros, rds, device=x_pix.device) # pts has shape (SB, NV, num_rays, 3)
 
         # Sample the radiance field with the points along the rays.
-        sigma_rad = radiance_field(pts, viewdirs=rds) # (SB, NV*num_rays, 4)
-        sigma_rad = sigma_rad.squeeze(0)   # Get rid of SB dimension
-        sigma = sigma_rad[...,3]
-        rad = sigma_rad[...,:3]
-
-
-        # Reshape sigma and rad back to (NV, num_rays, self.n_samples, -1)
-        sigma = sigma.view(NV, num_rays, self.n_coarse, 1)
-        rad = rad.view(NV, num_rays, self.n_coarse, 3)
+        sigma_rad = radiance_field(pts.reshape(SB,-1,3), 
+            viewdirs=rds.unsqueeze(3).expand(SB, NV, num_rays, self.n_coarse, -1).reshape(SB,-1,3)
+            ) # (SB, NV*num_rays, 4)
+        sigma = sigma_rad[...,3].view(SB, NV, num_rays, self.n_coarse, 1) # (SB, NV, num_rays, n_coarse, 1)
+        rad = sigma_rad[...,:3].view(SB, NV, num_rays, self.n_coarse, 3) # (SB, NV, num_rays, n_coarse, 3)
 
         # Compute pixel colors, depths, and weights via the volume integral.
-        rgb, distance_map, weights = volume_integral(z_vals, sigma, rad) # (NV, num_rays, _)
+        rgb, distance_map, weights = volume_integral(z_vals, sigma, rad) 
+        # (SB, NV, num_rays, _) for rgb, (SB, NV, num_rays, n_coarse, 1) for weights
 
         if self.white_back:
             accum = weights.sum(dim=-2)
             rgb = rgb + (1. - accum)
         
         # Re-calculate depth map since rds now does not have z=1
-        world_coordinates = ros + rds.reshape(NV, num_rays, self.n_coarse, -1)[...,0,:].squeeze() * distance_map
+        world_coordinates = ros + rds * distance_map
         depth_map = depth_from_world(world_coordinates, cam2world)
 
         return rgb, depth_map
