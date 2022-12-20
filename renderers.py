@@ -20,6 +20,15 @@ def sample_coarse(
         zz_vals = z_vals # (SB, NV, num_rays, n_coarse)
     return zz_vals
 
+def sample_fine(
+    near_depth, # (SB, NV, num_ways)
+    far_depth, # (SB, NV, num_ways)
+    num_samples: int,
+    weights, # # (SB, NV, num_rays, n_coarse, 1)
+    device: torch.device,
+):
+
+
 def volume_integral(
     z_vals: torch.tensor, # (SB, NV, num_rays, n_coarse)
     sigmas: torch.tensor,  # (SB, NV, num_rays, n_coarse, 1)
