@@ -1,22 +1,13 @@
 from utils import *
 
 
-def sample_points_along_rays(
+def sample_coarse(
     near_depth, # (SB, NV, num_ways)
     far_depth, # (SB, NV, num_ways)
     num_samples: int,
-    ray_origins: torch.Tensor,  # (SB, NV, num_ways, 3)
-    ray_directions: torch.Tensor,  # (SB, NV, num_ways, 3)
     device: torch.device,
     infinity = -1
 ):
-    near_depth = torch.tensor(near_depth)
-    far_depth = torch.tensor(far_depth)
-    # near_depth and far_depth should have dim (SB, NV, num_rays)
-    if len(near_depth.shape) == 0:
-        near_depth = near_depth.expand_as(ray_origins[...,0])
-        far_depth = far_depth.expand_as(ray_origins[...,0])
-
     # Compute a linspace of num_samples depth values beetween near_depth and far_depth.
     steps = torch.arange(num_samples, dtype=torch.float32, device=device) / num_samples # n_coarse
     z_vals = near_depth.unsqueeze(-1) + torch.einsum('bns,j->bnsj', far_depth-near_depth, steps)  # (SB, NV, num_rays, n_coarse)
@@ -27,17 +18,13 @@ def sample_points_along_rays(
         ], -1) 
     else: 
         zz_vals = z_vals # (SB, NV, num_rays, n_coarse)
-
-    # Using the ray_origins, ray_directions, generate 3D points along
-    # the camera rays according to the z_vals.
-    pts = ray_origins.unsqueeze(-2) + torch.einsum('bnsi,bnsj->bnsji', ray_directions, zz_vals)  # (SB, NV, num_rays, n_coarse, 3)
-
-    return pts, zz_vals
+    return zz_vals
 
 def volume_integral(
     z_vals: torch.tensor, # (SB, NV, num_rays, n_coarse)
     sigmas: torch.tensor,  # (SB, NV, num_rays, n_coarse, 1)
-    radiances: torch.tensor  # (SB, NV, num_rays, n_coarse, 3)
+    radiances: torch.tensor,  # (SB, NV, num_rays, n_coarse, 3)
+    white_back=True
 ) -> Tuple[torch.tensor, torch.tensor]:
 
     # Compute the deltas in depth between the points.
@@ -58,9 +45,7 @@ def volume_integral(
         torch.cumprod(1.-alpha+1e-10, -2)[...,:-1,:],
         ], -2) 
 
-    # Compute the weights from the Ts and the alphas.
-    ind = 0
-    
+    # Compute the weights from the Ts and the alphas.    
     weights = alpha * Ts # (SB, NV, num_rays, n_coarse, 1)
     
     # Compute the pixel color as the weighted sum of the radiance values.
@@ -70,6 +55,10 @@ def volume_integral(
     # Tip: use torch.einsum for a convenient way of computing the weighted sum,
     # without the need to reshape the z_vals.
     depth_map = torch.einsum('bnrzs, bnrz -> bnrs', weights, z_vals) # (SB, NV, num_rays, 1)
+
+    if white_back:
+        accum = weights.sum(dim=-2)
+        rgb = rgb + (1. - accum)
 
     return rgb, depth_map, weights
 
@@ -119,31 +108,47 @@ class VolumeRenderer(nn.Module):
         # Use the function get_world_rays.
         ros, rds = get_world_rays(x_pix, intrinsics, cam2world) # (SB, NV, num_ways, 3)
 
-        # Generate the points along rays and their depth values
-        # Use the function sample_points_along_rays.
-        pts, z_vals = sample_points_along_rays(self.near, self.far, self.n_coarse, 
-                                                ros, rds, device=x_pix.device) # pts has shape (SB, NV, num_rays, 3)
-
-        # Sample the radiance field with the points along the rays.
-        sigma_rad = radiance_field(pts.reshape(SB,-1,3), 
-            viewdirs=rds.unsqueeze(3).expand(SB, NV, num_rays, self.n_coarse, -1).reshape(SB,-1,3)
+        ### Coarse sampling
+        z_vals_coarse = sample_coarse(torch.tensor(self.near).expand_as(ros[...,0]), torch.tensor(self.far).expand_as(ros[...,0]), 
+                                                self.n_coarse, device=x_pix.device) # pts has shape (SB, NV, num_rays, n_coarse, 3)
+        pts_coarse = ros.unsqueeze(-2) + torch.einsum('bnsi,bnsj->bnsji', rds, z_vals_coarse)  # (SB, NV, num_rays, n_coarse, 3)
+        
+        sigma_rad = radiance_field(pts_coarse.reshape(SB,-1,3), 
+            viewdirs=rds.unsqueeze(3).expand(SB, NV, num_rays, self.n_coarse, -1).reshape(SB,-1,3),
+            coarse=True
             ) # (SB, NV*num_rays, 4)
         sigma = sigma_rad[...,3].view(SB, NV, num_rays, self.n_coarse, 1) # (SB, NV, num_rays, n_coarse, 1)
         rad = sigma_rad[...,:3].view(SB, NV, num_rays, self.n_coarse, 3) # (SB, NV, num_rays, n_coarse, 3)
 
-        # Compute pixel colors, depths, and weights via the volume integral.
-        rgb, distance_map, weights = volume_integral(z_vals, sigma, rad) 
+        rgb_coarse, distance_map_corase, weights_coarse = volume_integral(z_vals_coarse, sigma, rad, white_back=self.white_back) 
         # (SB, NV, num_rays, _) for rgb, (SB, NV, num_rays, n_coarse, 1) for weights
 
-        if self.white_back:
-            accum = weights.sum(dim=-2)
-            rgb = rgb + (1. - accum)
+        ### Fine sampling
+        z_vals_fine = sample_fine(torch.tensor(self.near).expand_as(ros[...,0]), torch.tensor(self.far).expand_as(ros[...,0]),
+                    self.n_fine-self.n_fine_depth, weights_coarse, device=x_pix.device) # z_vals has shape (SB, NV, num_rays, n)
+        z_vals_depth = sample_depth(distance_map_corase, self.n_fine_depth, self.depth_std, device=x_pix.device)
+
+        z_vals = torch.cat([z_vals_coarse,z_vals_fine,z_vals_depth],dim=-1)
+        z_vals_sorted, _ = torch.sort(z_vals, dim=-1)
+
+        pts_sorted = ros.unsqueeze(-2) + torch.einsum('bnsi,bnsj->bnsji', rds, z_vals_sorted)  # (SB, NV, num_rays, n, 3)
+
+
+        sigma_rad = radiance_field(pts_sorted.reshape(SB,-1,3), 
+            viewdirs=rds.unsqueeze(3).expand(SB, NV, num_rays, self.n_coarse+self.n_fine, -1).reshape(SB,-1,3),
+            coarse=False
+            ) # (SB, NV*num_rays, 4)
+        sigma = sigma_rad[...,3].view(SB, NV, num_rays, self.n_coarse+self.n_fine, 1) # (SB, NV, num_rays, n_coarse, 1)
+        rad = sigma_rad[...,:3].view(SB, NV, num_rays, self.n_coarse+self.n_fine, 3) # (SB, NV, num_rays, n_coarse, 3)
+
+        rgb_fine, distance_map_fine, _ = volume_integral(z_vals_sorted, sigma, rad, white_back=self.white_back) 
+        # (SB, NV, num_rays, _) for rgb, (SB, NV, num_rays, n_coarse+n_fine, 1) for weights
         
         # Re-calculate depth map since rds now does not have z=1
-        world_coordinates = ros + rds * distance_map
-        depth_map = depth_from_world(world_coordinates, cam2world)
+        world_coordinates_fine = ros + rds * distance_map_fine
+        depth_map_fine = depth_from_world(world_coordinates_fine, cam2world)
 
-        return rgb, depth_map
+        return rgb_coarse, rgb_fine, depth_map_fine
 
     @classmethod
     def from_conf(cls, conf, white_back=False):
@@ -344,12 +349,11 @@ class AdaptiveVolumeRenderer(nn.Module):
         z_scales = rds[...,2].unsqueeze(2) # (NV, num_ways, 1)
 
         # Generate the points along rays and their depth values
-        # Use the function sample_points_along_rays.
         # print("start")
         # a = time.time()
         distance = ((world_coords[-1][...,0] - ros[...,0]) / rds[...,0]).unsqueeze(2)
 
-        pts, z_vals = batch_sample_points_along_rays(distance - self.epsilon,
+        pts, z_vals = sample_coarse(distance - self.epsilon,
                                                      distance + self.epsilon, 
                                                      self.n_coarse, ros, rds, device=xy_pix.device) # pts has shape (NV, num_rays, 3)
         # print("end", time.time() - a)

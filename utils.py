@@ -52,6 +52,14 @@ def batched_index_select_nd_second(t, inds):
         2, inds[(...,) + (None,) * (len(t.shape) - 3)].expand(-1, -1, -1, *t.shape[3:])
     )
 
+def data_loop(dl):
+    """
+    Loop an iterable infinitely
+    """
+    while True:
+        for x in iter(dl):
+            yield x
+
 # NN functions
 def to_gpu(ob):
     if isinstance(ob, collections.Mapping):
@@ -310,17 +318,3 @@ def generate_video(model_input, num_frames, radius, net, model):
             img = np.clip(img, 0, 255).astype(np.uint8)
             frames.append(img)
     return frames
-
-# Loss functions
-def calculate_psnr(rgb, gt):
-    rgb = rgb.squeeze().detach().cpu().numpy()
-    rgb = (rgb/ 2.) + 0.5
-    rgb = np.clip(rgb, a_min=0., a_max=1.)
-    
-    gt = gt.squeeze().detach().cpu().numpy()
-    gt = (gt / 2.) + 0.5
-    
-    ssim = skimage.measure.compare_ssim(rgb, gt, multichannel=True, data_range=1)
-    psnr = skimage.measure.compare_psnr(rgb, gt, data_range=1)
-
-    return psnr, ssim
