@@ -132,8 +132,8 @@ def fit(
 
 # Loss functions
 def mse_loss(mlp_out, gt):
-    img_coarse, _, _ = mlp_out
-    return ((img_coarse - gt)**2).mean()
+    _, img, _ = mlp_out
+    return ((img - gt)**2).mean()
 
 def mse_loss_fine(mlp_out, gt):
     img_coarse, img_fine, _ = mlp_out
@@ -141,7 +141,7 @@ def mse_loss_fine(mlp_out, gt):
 
 def mse_regularization_loss(mlp_out, gt, near=0.5, far=2.0):
     # add regularization loss
-    img, _, depth = mlp_out
+    _, img, depth = mlp_out
     penalty = (torch.min(depth-near, torch.zeros_like(depth)) ** 2) + (torch.max(depth-far, torch.zeros_like(depth)) ** 2)
     return ((img - gt)**2).mean() + torch.mean(penalty) * 10000
 

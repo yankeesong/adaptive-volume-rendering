@@ -337,14 +337,13 @@ class RadFieldAndRenderer(nn.Module):
         intrinsics = model_input['intrinsics'] # (SB, NV, 3, 3)
         c2w = model_input['cam2world'] # (SB, NV, 4, 4)
 
-        rgb, depth = self.renderer(
+        return  self.renderer(
                               c2w,
                               intrinsics,
                               xy_pix, 
                               self.rf
                               ) # (SB, NV, num_rays, 3/1)
-        
-        return rgb, depth
+
     
     def load_weights(self, model_path, opt_init=False, strict=True, device=None):
         """

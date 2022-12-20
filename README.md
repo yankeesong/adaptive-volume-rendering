@@ -9,7 +9,6 @@
 - Collect all samples, sort, then pass through fine network
 
 ## TODO list
-- Do coarse + fine sampling
-- For visualization and validation, only do fine sampling
+- Modify raymarcher and adaptive raymarcher
 - Make the whole thing into a script and write results to tensorboard
 - Add test step

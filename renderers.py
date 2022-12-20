@@ -24,9 +24,34 @@ def sample_fine(
     near_depth, # (SB, NV, num_ways)
     far_depth, # (SB, NV, num_ways)
     num_samples: int,
-    weights, # # (SB, NV, num_rays, n_coarse, 1)
+    weights, # (SB, NV, num_rays, n_coarse, 1)
     device: torch.device,
 ):
+    SB, NV, num_rays, n_coarse, _ = weights.shape
+
+    weights = weights.squeeze(-1).detach() + 1e-5  # Prevent division by zero, (SB, NV, num_rays, n_coarse)
+    pdf = weights / torch.sum(weights, -1, keepdim=True)  # (SB, NV, num_rays, n_coarse)
+    cdf = torch.cumsum(pdf, -1)  # (SB, NV, num_rays, n_coarse)
+    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)  # (SB, NV, num_rays, n_coarse+1)
+
+    u = torch.rand(SB, NV, num_rays, num_samples, dtype=torch.float32, device=device)  # (SB, NV, num_rays, n_fine)
+    inds = torch.searchsorted(cdf, u, right=True).float() - 1.0  # (SB, NV, num_rays, n_fine)
+    inds = torch.clamp_min(inds, 0.0)
+
+    z_steps = (inds + torch.rand_like(inds)) / n_coarse  # (SB, NV, num_rays, n_fine)
+    z_samp = near_depth.unsqueeze(-1) + torch.einsum('bns,bnsj->bnsj', far_depth-near_depth, z_steps)  # (SB, NV, num_rays, n_fine)
+
+    return z_samp
+
+def sample_depth(
+    depth, # (SB, NV, num_rays, 1)
+    num_samples: int,
+    depth_std,
+):  
+    SB, NV, num_rays, _ = depth.shape
+    z_samp = depth.expand((SB, NV, num_rays, num_samples))
+    z_vals = torch.randn_like(z_samp) * depth_std
+    return z_vals
 
 
 def volume_integral(
@@ -135,7 +160,8 @@ class VolumeRenderer(nn.Module):
         ### Fine sampling
         z_vals_fine = sample_fine(torch.tensor(self.near).expand_as(ros[...,0]), torch.tensor(self.far).expand_as(ros[...,0]),
                     self.n_fine-self.n_fine_depth, weights_coarse, device=x_pix.device) # z_vals has shape (SB, NV, num_rays, n)
-        z_vals_depth = sample_depth(distance_map_corase, self.n_fine_depth, self.depth_std, device=x_pix.device)
+        z_vals_depth = sample_depth(distance_map_corase, self.n_fine_depth, self.depth_std)
+        z_vals_depth = torch.clamp(z_vals_depth,self.near,self.far)
 
         z_vals = torch.cat([z_vals_coarse,z_vals_fine,z_vals_depth],dim=-1)
         z_vals_sorted, _ = torch.sort(z_vals, dim=-1)
@@ -175,7 +201,7 @@ class VolumeRenderer(nn.Module):
 class Raymarcher(nn.Module):
     def __init__(self,
                  num_feature_channels,
-                 raymarch_steps, near = 0.5, far = 2.0):
+                 raymarch_steps):
         super().__init__()
 
         self.n_feature_channels = num_feature_channels
@@ -191,80 +217,55 @@ class Raymarcher(nn.Module):
         self.out_layer = nn.Linear(hidden_size, 1)
         self.counter = 0
 
-        self.near = near
-        self.far = far
-
     def forward(self,
                 cam2world,
                 intrinsics,
                 xy_pix, # xy_pix has shape 
                 phi):  # Here phi is pixelnerf net
-        NV, num_rays, _ = xy_pix.shape
+        SB, NV, num_rays, _ = xy_pix.shape
 
-        ros, rds = get_world_rays(xy_pix, intrinsics=intrinsics, cam2world=cam2world) # (NV, num_rays, 3)
+        ros, rds = get_world_rays(xy_pix, intrinsics=intrinsics, cam2world=cam2world) # (SB, NV, num_rays, 3)
 
-        initial_depth = torch.zeros((NV, num_rays, 1)).normal_(mean=0.8, std=5e-2).to(xy_pix.device)
-
-        init_world_coords = ros + rds * initial_depth
+        initial_distance = torch.zeros((SB, NV, num_rays, 1)).normal_(mean=0.8, std=5e-2).to(xy_pix.device)
+        init_world_coords = ros + rds * initial_distance
 
         world_coords = [init_world_coords]
-        depths = [initial_depth]
         states = [None]
 
 
         for step in range(self.steps):
 
-            v = phi(world_coords[-1].reshape(1,-1,3), viewdirs = rds.reshape(1,-1,3), return_features = True)   # (1, NV*num_rays, self.n_feature_channels)
+            v = phi(world_coords[-1].reshape(SB,-1,3), viewdirs = rds.reshape(SB,-1,3), return_features = True)   # (SB, NV*num_rays, self.n_feature_channels)
 
-            state = self.lstm(v.squeeze(0), states[-1])  # (NV*num_rays, self.n_feature_channels)
+            state = self.lstm(v.reshape(-1,self.n_feature_channels), states[-1])  # (SB*NV*num_rays, self.n_feature_channels)
 
             if state[0].requires_grad:
                 state[0].register_hook(lambda x: x.clamp(min=-10, max=10))
 
-            signed_distance = self.out_layer(state[0]).view(NV, num_rays, 1) # (NV, num_rays, 1)
+            signed_distance = self.out_layer(state[0]).view(SB, NV, num_rays, 1) # (SB, NV, num_rays, 1)
 
-            new_world_coords = world_coords[-1] + rds * signed_distance
+            new_world_coords = world_coords[-1] + rds * signed_distance # (SB, NV, num_rays, 3)
 
             states.append(state)
             world_coords.append(new_world_coords)
 
-            depth = depth_from_world(world_coords[-1], cam2world)
-
-            depths.append(depth)
-
-        # commented out for now
-        # if not self.counter % 100:
-        #     # Write tensorboard summary for each step of ray-marcher.
-        #     drawing_depths = torch.stack(depths, dim=0)[:, 0, :, :]
-        #     drawing_depths = lin2img(drawing_depths).repeat(1, 3, 1, 1)
-        #     log.append(('image', 'raycast_progress',
-        #                 torch.clamp(torchvision.utils.make_grid(drawing_depths, scale_each=False, normalize=True), 0.0,
-        #                             5),
-        #                 100))
-
-        #     # Visualize residual step distance (i.e., the size of the final step)
-        #     fig = show_images([lin2img(signed_distance)[i, :, :, :].detach().cpu().numpy().squeeze()
-        #                             for i in range(batch_size)])
-        #     log.append(('figure', 'stopping_distances', fig, 100))
         self.counter += 1
-        output = phi(world_coords[-1].reshape(1,-1,3), viewdirs = rds.reshape(1,-1,3), return_features = False)
+        output = phi(world_coords[-1].reshape(SB,-1,3), viewdirs = rds.reshape(SB,-1,3), coarse = False, return_features = False)
 
-        rgb = output[..., :3].reshape(NV, num_rays,3)
-        sigma = output[..., 3:4].reshape(NV, num_rays,1) 
-        final_depth = depths[-1].reshape(NV, num_rays, -1)
+        rgb = output[..., :3].reshape(SB, NV, num_rays, 3)
+        final_depth = depth_from_world(world_coords[-1], cam2world).reshape(SB, NV, num_rays, -1)
 
-        # return world_coords[-1], depths[-1], log
-        return rgb, final_depth # See here the output is a bit different
+        return None, rgb, final_depth
 
     @classmethod
     def from_conf(cls, conf):
         return cls(
             num_feature_channels=conf.get_int("num_feature_channels", 512),
-            raymarch_steps = conf.get_int("raymarch_steps", 30),
+            raymarch_steps = conf.get_int("raymarch_steps", 10),
         )
 
 class AdaptiveVolumeRenderer(nn.Module):
-    def __init__(self, num_feature_channels, raymarch_steps, epsilon, n_coarse=16, white_back=True):
+    def __init__(self, num_feature_channels, raymarch_steps, epsilon, n_coarse=20, white_back=True):
         super().__init__()
         self.epsilon = epsilon
         self.n_coarse = n_coarse
@@ -311,96 +312,65 @@ class AdaptiveVolumeRenderer(nn.Module):
             depth_map: for each pixel coordinate x_pix, the depth of the respective ray.
  
         """
-        NV, num_rays, _ = xy_pix.shape
+        SB, NV, num_rays, _ = xy_pix.shape
 
-        ros, rds = get_world_rays(xy_pix, intrinsics=intrinsics, cam2world=cam2world) # (NV, num_rays, 3)
+        ros, rds = get_world_rays(xy_pix, intrinsics=intrinsics, cam2world=cam2world) # (SB, NV, num_rays, 3)
 
-        initial_depth = torch.zeros((NV, num_rays, 1)).normal_(mean=0.8, std=5e-2).to(xy_pix.device)
+        initial_distance = torch.zeros((SB, NV, num_rays, 1)).normal_(mean=0.8, std=5e-2).to(xy_pix.device)
 
-        init_world_coords = ros + rds * initial_depth
+        init_world_coords = ros + rds * initial_distance
 
         world_coords = [init_world_coords]
-        depths = [initial_depth]
         states = [None]
 
 
-        for step in range(self.steps):
+        for _ in range(self.steps):
 
-            v = phi(world_coords[-1].reshape(1,-1,3), viewdirs = rds.reshape(1,-1,3), return_features = True)   # (1, NV*num_rays, self.n_feature_channels)
+            v = phi(world_coords[-1].reshape(SB,-1,3), viewdirs = rds.reshape(SB,-1,3), return_features = True)   # (1, NV*num_rays, self.n_feature_channels)
 
-            state = self.lstm(v.squeeze(0), states[-1])  # (NV*num_rays, self.n_feature_channels)
+            state = self.lstm(v.reshape(-1,self.n_feature_channels), states[-1])  # (SB*NV*num_rays, self.n_feature_channels)
 
             if state[0].requires_grad:
                 state[0].register_hook(lambda x: x.clamp(min=-10, max=10))
 
-            signed_distance = self.out_layer(state[0]).view(NV, num_rays, 1) # (NV, num_rays, 1)
+            signed_distance = self.out_layer(state[0]).view(SB, NV, num_rays, 1) # (SB, NV, num_rays, 1)
 
             new_world_coords = world_coords[-1] + rds * signed_distance
 
             states.append(state)
             world_coords.append(new_world_coords)
-
-            depth = depth_from_world(world_coords[-1], cam2world)
-            # commented out for now
-
-            # print("Raymarch step %d: Min depth %0.6f, max depth %0.6f" %
-            #           (step, depths[-1].min().detach().cpu().numpy(), depths[-1].max().detach().cpu().numpy()))
-
-            depths.append(depth)
-        
-#         print(f'depth out of raymarcher: {depths[-1].min().detach().cpu().numpy()},{depths[-1].max().detach().cpu().numpy()}')
             
-        # Compute the ray directions in world coordinates.
-        # Use the function get_world_rays.
-        ros, rds = get_world_rays(xy_pix, intrinsics, cam2world)
-#         print(world_coords[-1][0][528])
-        
-        z_scales = rds[...,2].unsqueeze(2) # (NV, num_ways, 1)
 
         # Generate the points along rays and their depth values
-        # print("start")
-        # a = time.time()
-        distance = ((world_coords[-1][...,0] - ros[...,0]) / rds[...,0]).unsqueeze(2)
+        final_distance = ((world_coords[-1][...,0] - ros[...,0]) / rds[...,0]) # (SB, NV, num_rays)
 
-        pts, z_vals = sample_coarse(distance - self.epsilon,
-                                                     distance + self.epsilon, 
-                                                     self.n_coarse, ros, rds, device=xy_pix.device) # pts has shape (NV, num_rays, 3)
-        # print("end", time.time() - a)
+        z_vals = sample_coarse(final_distance - self.epsilon, final_distance + self.epsilon, 
+                                    self.n_coarse, device=xy_pix.device, infinity=1.8) # z_vals has shape (SB, NV, num_rays, n_coarse)
+        z_vals_sorted, _ = torch.sort(z_vals, dim=-1)
 
-
-        rds = rds.unsqueeze(2).expand(NV, num_rays, self.n_coarse, -1)
-
-        # 
-
-        # Input view directions
-        # (NV*num_ways, 3)
+        pts_sorted = ros.unsqueeze(-2) + torch.einsum('bnsi,bnsj->bnsji', rds, z_vals_sorted)  # (SB, NV, num_rays, n, 3)
 
         # Sample the radiance field with the points along the rays.
-        sigma_rad = phi(pts.reshape(1,-1,3), viewdirs=rds.reshape(1,-1,3), return_features = False)
-        sigma = sigma_rad[...,3].reshape(NV, num_rays, self.n_coarse, 1)
-        rad = sigma_rad[...,:3].reshape(NV, num_rays, self.n_coarse, 3)
+        sigma_rad = phi(pts_sorted.reshape(SB,-1,3), coarse=False,
+                    viewdirs=rds.unsqueeze(-2).expand(SB, NV, num_rays, self.n_coarse, -1).reshape(SB,-1,3), return_features = False)
+        sigma = sigma_rad[...,3].reshape(SB, NV, num_rays, self.n_coarse, 1)
+        rad = sigma_rad[...,:3].reshape(SB, NV, num_rays, self.n_coarse, 3)
 
         # Compute pixel colors, depths, and weights via the volume integral.
-        rgb, distance_map, weights = batch_volume_integral(z_vals, sigma, rad)
+        rgb, distance_map, _ = volume_integral(z_vals_sorted, sigma, rad, white_back=self.white_back)
 
-        if self.white_back:
-            accum = weights.sum(dim=-2)
-            rgb = rgb + (1. - accum)
-        
         # Re-calculate depth map since rds now does not have z=1
-        world_coordinates = ros + rds.reshape(NV, num_rays, self.n_coarse, -1)[...,0,:].squeeze() * distance_map
+        world_coordinates = ros + rds * distance_map
         depth_map = depth_from_world(world_coordinates, cam2world)
 
-        return rgb, depth_map
+        return None, rgb, depth_map
 
     @classmethod
     def from_conf(cls, conf, white_back=False):
         return cls(
             num_feature_channels=conf.get_int("num_feature_channels", 512),
-            raymarch_steps = conf.get_int("raymarch_steps", 30),
-            epsilon = conf.get_float("epsilon", 0.5),
-            n_coarse=conf.get_int("n_coarse", 16),
-            # near=conf.get_float("near", 1.0),
-            # far=conf.get_float("far", 2.5),
+            raymarch_steps = conf.get_int("raymarch_steps", 10),
+            epsilon = conf.get_float("epsilon", 0.05),
+            n_coarse=conf.get_int("n_coarse", 20),
             white_back=conf.get_float("white_back", white_back),
         )
