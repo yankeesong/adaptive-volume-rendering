@@ -5,111 +5,52 @@ def pick(list, item_idcs):
         return list
     return [list[i] for i in item_idcs]
 
-def glob_imgs(path):
-    imgs = []
-    for ext in ['*.png', '*.jpg', '*.JPEG', '*.JPG']:
-        imgs.extend(glob(os.path.join(path, ext)))
-    return imgs
-
-
-def parse_intrinsics(filepath, trgt_sidelength=None, invert_y=False):
-    # Get camera intrinsics
-    with open(filepath, 'r') as file:
-        f, cx, cy, _ = map(float, file.readline().split())
-        grid_barycenter = torch.Tensor(list(map(float, file.readline().split())))
-        scale = float(file.readline())
-        height, width = map(float, file.readline().split())
-
-        try:
-            world2cam_poses = int(file.readline())
-        except ValueError:
-            world2cam_poses = None
-
-    if world2cam_poses is None:
-        world2cam_poses = False
-
-    world2cam_poses = bool(world2cam_poses)
-
-    cx = cx/width
-    cy = cy/height
-    f = f/height
-
-    # Build the intrinsic matrices
-    intrinsic = np.array([[f, 0., cx],
-                               [0., f, cy],
-                               [0., 0, 1]])
-
-    return intrinsic, grid_barycenter, scale, world2cam_poses
-
-def load_pose(filename):
-    lines = open(filename).read().splitlines()
-    if len(lines) == 1:
-        pose = np.zeros((4, 4), dtype=np.float32)
-        for i in range(16):
-            pose[i // 4, i % 4] = lines[0].split(" ")[i]
-        return pose.squeeze()
-    else:
-        lines = [[x[0], x[1], x[2], x[3]] for x in (x.split(" ") for x in lines[:4])]
-        return np.asarray(lines).astype(np.float32).squeeze()
-
-
-
 class SceneInstanceDataset():
     """This creates a dataset class for a single object instance (such as a single car)."""
 
     def __init__(self,
+                 filename,
                  instance_idx,
-                 instance_dir,
+                 instance_key,
                  specific_observation_idcs=None,  # For few-shot case: Can pick specific observations only
                  img_sidelength=None,
                  num_images=-1):
+        self.f = h5py.File(filename, 'r')
         self.instance_idx = instance_idx
         self.img_sidelength = img_sidelength
-        self.instance_dir = instance_dir
+        self.instance_key = instance_key
 
-        color_dir = os.path.join(instance_dir, "rgb")
-        pose_dir = os.path.join(instance_dir, "pose")
-        param_dir = os.path.join(instance_dir, "params")
-
-        if not os.path.isdir(color_dir):
-            print("Error! root dir %s is wrong" % instance_dir)
-            return
-
-        self.has_params = os.path.isdir(param_dir)
-        self.color_paths = sorted(glob_imgs(color_dir))
-        self.pose_paths = sorted(glob(os.path.join(pose_dir, "*.txt")))
-
-        if self.has_params:
-            self.param_paths = sorted(glob(os.path.join(param_dir, "*.txt")))
-        else:
-            self.param_paths = []
-
-
+        self.color_keys = self.f[self.instance_key]['rgb'].keys()
+        self.pose_keys = self.f[self.instance_key]['pose'].keys()
         
         if specific_observation_idcs is not None:
-            self.color_paths = pick(self.color_paths, specific_observation_idcs)
-            self.pose_paths = pick(self.pose_paths, specific_observation_idcs)
-            self.param_paths = pick(self.param_paths, specific_observation_idcs)
+            self.color_keys = pick(self.color_keys, specific_observation_idcs)
+            self.pose_keys = pick(self.pose_keys, specific_observation_idcs)
 
         if specific_observation_idcs is None and num_images != -1:
             idcs = np.linspace(0, stop=len(self.color_paths), num=num_images, endpoint=False, dtype=int)
-            self.color_paths = pick(self.color_paths, idcs)
-            self.pose_paths = pick(self.pose_paths, idcs)
-            self.param_paths = pick(self.param_paths, idcs)
+            self.color_keys = pick(self.color_keys, idcs)
+            self.pose_keys = pick(self.pose_keys, idcs)
 
     def set_img_sidelength(self, new_img_sidelength):
         """For multi-resolution training: Updates the image sidelength with whichimages are loaded."""
         self.img_sidelength = new_img_sidelength
 
     def __len__(self):
-        return len(self.pose_paths)
+        return len(self.pose_keys)
 
     def __getitem__(self, idx): # This index means observation index
-        intrinsics, _, _, _ = parse_intrinsics(os.path.join(self.instance_dir, "intrinsics.txt"),
-                                                                  trgt_sidelength=self.img_sidelength)
+        focal, cx, cy, width, height = self.f[self.instance_key]['intrinsics'][...]
+        cx = cx/width
+        cy = cy/height
+        focal = focal/height
+        intrinsics = np.array([[focal, 0., cx],
+                                [0., focal, cy],
+                                [0., 0, 1]])
+
         intrinsics = torch.Tensor(intrinsics).float()
 
-        img = imageio.imread(self.color_paths[idx])[:, :, :3]
+        img = self.f[self.instance_key]['rgb'][self.color_keys[idx]][...]
         ops = [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),]
         
 
@@ -128,7 +69,8 @@ class SceneInstanceDataset():
         op = transforms.Compose(ops)
         rgb = op(img).permute(1,2,0).reshape(self.img_sidelength*self.img_sidelength,-1)
 
-        c2w = torch.from_numpy(load_pose(self.pose_paths[idx])) @ torch.diag(torch.tensor([1, -1, -1, 1], dtype=torch.float32))
+        c2w = torch.from_numpy(self.f[self.instance_key]['pose'][self.pose_keys[idx]][...]) \
+                    @ torch.diag(torch.tensor([1, -1, -1, 1], dtype=torch.float32))
 
 
         model_input = {"cam2world": c2w,
@@ -146,28 +88,30 @@ class SceneClassDataset(torch.utils.data.Dataset):
     """Dataset for a class of objects, where each datapoint is a SceneInstanceDataset."""
 
     def __init__(self,
-                 root_dir,
+                 filename,
                  img_sidelength=None,
                  max_num_instances=-1,
                  max_observations_per_instance=-1,
                  specific_observation_idcs=None,  # For few-shot case: Can pick specific observations only
                  samples_per_instance=2):
 
+        self.f = h5py.File(filename, 'r')
         self.samples_per_instance = samples_per_instance
-        self.instance_dirs = sorted(glob(os.path.join(root_dir, "*/")))
+        self.instance_keys = sorted(self.f.keys())
 
-        assert (len(self.instance_dirs) != 0), "No objects in the data directory"
+        assert (len(self.instance_keys) != 0), "No objects in the data directory"
         
 
         if max_num_instances != -1:
-            self.instance_dirs = self.instance_dirs[:max_num_instances]
+            self.instance_keys = self.instance_keys[:max_num_instances]
 
-        self.all_instances = [SceneInstanceDataset(instance_idx=idx,
-                                                   instance_dir=dir,
+        self.all_instances = [SceneInstanceDataset(filename,
+                                                   instance_idx=idx,
+                                                   instance_key=key,
                                                    specific_observation_idcs=specific_observation_idcs,
                                                    img_sidelength=img_sidelength,
                                                    num_images=max_observations_per_instance)
-                              for idx, dir in enumerate(self.instance_dirs)]
+                              for idx, key in enumerate(self.instance_keys)]
 
         self.num_per_instance_observations = [len(obj) for obj in self.all_instances]
         self.num_instances = len(self.all_instances)

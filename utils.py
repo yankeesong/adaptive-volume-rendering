@@ -6,6 +6,7 @@ from torch.utils.data import IterableDataset, DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Callable, List, Optional, Tuple, Generator, Dict
+import lpips
 import os
 import sys
 import gdown
@@ -249,6 +250,92 @@ def depth_from_world(world_coords, cam2world):
     points_hom = homogenize_points(world_coords)  # (batch, NV, num_samples, 4)
     points_cam = transform_world2cam(points_hom,cam2world)  # (batch, NV, num_samples, 4)
     return -points_cam[...,2]  # (batch, NV, num_samples, 1)
+
+# Loss functions
+def mse_loss(mlp_out, gt):
+    _, img, _ = mlp_out
+    return ((img - gt)**2).mean()
+
+def mse_loss_fine(mlp_out, gt):
+    img_coarse, img_fine, _ = mlp_out
+    return ((img_coarse - gt)**2).mean() + ((img_fine - gt)**2).mean()
+
+def mse_regularization_loss(mlp_out, gt, near=0.5, far=2.0):
+    # add regularization loss
+    _, img, depth = mlp_out
+    penalty = (torch.min(depth-near, torch.zeros_like(depth)) ** 2) + (torch.max(depth-far, torch.zeros_like(depth)) ** 2)
+    return ((img - gt)**2).mean() + torch.mean(penalty) * 10000
+
+# Plotting functions
+def plot_output_ground_truth(vis_output, vis_gt, resolution, src_idx):
+    _, vis_img, vis_depth = vis_output
+
+    SB = vis_img.shape[0]
+
+    _, axes = plt.subplots(SB, 3, figsize=(18, 6*SB), squeeze=False)
+
+    for sb in range(SB):
+        img = vis_img[sb,0]
+        depth = vis_depth[sb,0]
+        gt = vis_gt[sb,0]
+
+        axes[sb, 0].imshow(img.cpu().view(*resolution).detach().numpy())
+        if src_idx[sb,0] == 0:
+            title = "Trained MLP (same view as src)"
+        else:
+            title = "Trained MLP"
+        axes[sb, 0].set_title(title)
+        axes[sb, 1].imshow(gt.cpu().view(*resolution).detach().numpy())
+        axes[sb, 1].set_title("Ground Truth")
+        axes[sb, 2].imshow(depth.cpu().view(*resolution[:2]).detach().numpy(), cmap='Greys')
+        axes[sb, 2].set_title("Depth")
+        
+        for j in range(3):
+            axes[sb,j].set_axis_off()
+    plt.show()
+
+def get_metrics(mlp_out, gts): # rgb and gt are both 0 to 1 already
+    _, rgbs, _ = mlp_out
+    SB, NV, sl2, _ = rgbs.shape
+    sl = int(np.sqrt(sl2))
+
+    rgbs = rgbs.reshape(SB, NV, sl, sl, 3).detach().cpu().numpy()
+    gts = gts.reshape(SB, NV, sl, sl, 3).detach().cpu().numpy()
+
+    psnrs = []
+    ssims = []
+
+    for sb in range(SB):
+        total_psnr = 0
+        total_ssim = 0
+
+        for nv in range(NV):
+            ssim = skimage.measure.structural_similarity(rgbs[sb,nv,...], gts[sb,nv,...], channel_axis=-1, data_range=1)
+            psnr = skimage.measure.peak_signal_noise_ratio(rgbs[sb,nv,...], gts[sb,nv,...], data_range=1)
+            total_ssim += ssim
+            total_psnr += psnr
+        
+        psnrs.append(total_psnr/NV)
+        ssims.append(total_ssim/NV)
+
+    return np.mean(psnr), np.mean(ssim)
+
+def get_lpips(mlp_out, gts):
+    _, rgbs, _ = mlp_out
+    SB, NV, sl2, _ = rgbs.shape
+    sl = int(np.sqrt(sl2))
+
+    rgbs = rgbs.reshape(SB, NV, sl, sl, 3).permute(0,1,4,2,3).detach() * 2 - 1 # (SB, NV, 3, sl, sl)
+    gts = gts.reshape(SB, NV, sl, sl, 3).permute(0,1,4,2,3).detach() * 2 - 1 # (SB, NV, 3, sl, sl)
+    lpips_vgg = to_gpu(lpips.LPIPS(net="vgg"))
+
+    lpipss = []
+
+    for sb in range(SB):
+        lpipss.append(lpips_vgg(rgbs[sb],gts[sb]))
+    lpips_all = torch.cat(lpipss)
+
+    return lpips_all.mean().item().cpu().numpy()
 
 # utils for generating videos
 def get_R(x,y,z):
