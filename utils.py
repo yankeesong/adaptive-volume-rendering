@@ -20,6 +20,7 @@ import warnings
 import time
 
 import math
+import functools
 import collections
 import traceback
 from einops import rearrange, repeat
@@ -41,17 +42,43 @@ def batched_index_select_nd(t, inds):
         1, inds[(...,) + (None,) * (len(t.shape) - 2)].expand(-1, -1, *t.shape[2:])
     )
 
-def batched_index_select_nd_second(t, inds):
+def bbox_sample(bboxes, num_pix):
     """
-    Index select on dim 2 of a >=2D multi-batched tensor. inds assumed
-    to have all batch dimensions except one data dimension 'n'
-    :param t (batch, n, m, ...)
-    :param inds (batch, n, k)
-    :return (batch, n, k, ...)
+    :return (num_pix, 3)
     """
-    return t.gather(
-        2, inds[(...,) + (None,) * (len(t.shape) - 3)].expand(-1, -1, -1, *t.shape[3:])
-    )
+    image_ids = torch.randint(0, bboxes.shape[0], (num_pix,))
+    pix_bboxes = bboxes[image_ids]    # (num_pix, 4)  [cmin, rmin, cmax, rmax]
+    x = (
+        torch.rand(num_pix) * (pix_bboxes[:, 2] + 1 - pix_bboxes[:, 0])
+        + pix_bboxes[:, 0]
+    ).long()
+    y = (
+        torch.rand(num_pix) * (pix_bboxes[:, 3] + 1 - pix_bboxes[:, 1])
+        + pix_bboxes[:, 1]
+    ).long()
+    pix = torch.stack((image_ids, y, x), dim=-1)
+    return pix
+
+def repeat_interleave(input, repeats, dim=0):
+    """
+    Repeat interleave along axis 0
+    torch.repeat_interleave is currently very slow
+    https://github.com/pytorch/pytorch/issues/31980
+    """
+    output = input.unsqueeze(1).expand(-1, repeats, *input.shape[1:])
+    return output.reshape(-1, *input.shape[1:])
+
+def combine_interleaved(t, inner_dims=(1,), agg_type="average"):
+    if len(inner_dims) == 1 and inner_dims[0] == 1:
+        return t
+    t = t.reshape(-1, *inner_dims, *t.shape[1:])
+    if agg_type == "average":
+        t = torch.mean(t, dim=1)
+    elif agg_type == "max":
+        t = torch.max(t, dim=1)[0]
+    else:
+        raise NotImplementedError("Unsupported combine type " + agg_type)
+    return t
 
 def data_loop(dl):
     """
@@ -63,7 +90,7 @@ def data_loop(dl):
 
 # NN functions
 def to_gpu(ob):
-    if isinstance(ob, collections.Mapping):
+    if isinstance(ob, collections.abc.Mapping):
         return {k: to_gpu(v) for k, v in ob.items()}
     elif isinstance(ob, tuple):
         return tuple(to_gpu(k) for k in ob)
@@ -105,6 +132,88 @@ def clip_grad_norm_hook(x, max_norm=10):
     clip_coef = max_norm / (total_norm + 1e-6)
     if clip_coef < 1:
         return x * clip_coef
+    
+def get_norm_layer(norm_type="instance", group_norm_groups=32):
+    """Return a normalization layer
+    Parameters:
+        norm_type (str) -- the name of the normalization layer: batch | instance | none
+    For BatchNorm, we use learnable affine parameters and track running statistics (mean/stddev).
+    For InstanceNorm, we do not use learnable affine parameters. We do not track running statistics.
+    """
+    if norm_type == "batch":
+        norm_layer = functools.partial(
+            nn.BatchNorm2d, affine=True, track_running_stats=True
+        )
+    elif norm_type == "instance":
+        norm_layer = functools.partial(
+            nn.InstanceNorm2d, affine=False, track_running_stats=False
+        )
+    elif norm_type == "group":
+        norm_layer = functools.partial(nn.GroupNorm, group_norm_groups)
+    elif norm_type == "none":
+        norm_layer = None
+    else:
+        raise NotImplementedError("normalization layer [%s] is not found" % norm_type)
+    return norm_layer
+
+def calc_same_pad_conv2d(t_shape, kernel_size=3, stride=1):
+    in_height, in_width = t_shape[-2:]
+    out_height = math.ceil(in_height / stride)
+    out_width = math.ceil(in_width / stride)
+
+    pad_along_height = max((out_height - 1) * stride + kernel_size - in_height, 0)
+    pad_along_width = max((out_width - 1) * stride + kernel_size - in_width, 0)
+    pad_top = pad_along_height // 2
+    pad_bottom = pad_along_height - pad_top
+    pad_left = pad_along_width // 2
+    pad_right = pad_along_width - pad_left
+    return pad_left, pad_right, pad_top, pad_bottom
+
+def same_unpad_deconv2d(t, kernel_size=3, stride=1, layer=None):
+    """
+    Perform SAME unpad on tensor, given kernel/stride of deconv operator.
+    Use after deconv called.
+    Dilation not supported.
+    """
+    if layer is not None:
+        if isinstance(layer, nn.Sequential):
+            layer = next(layer.children())
+        kernel_size = layer.kernel_size[0]
+        stride = layer.stride[0]
+    h_scaled = (t.shape[-2] - 1) * stride
+    w_scaled = (t.shape[-1] - 1) * stride
+    pad_left, pad_right, pad_top, pad_bottom = calc_same_pad_conv2d(
+        (h_scaled, w_scaled), kernel_size, stride
+    )
+    if pad_right == 0:
+        pad_right = -10000
+    if pad_bottom == 0:
+        pad_bottom = -10000
+    return t[..., pad_top:-pad_bottom, pad_left:-pad_right]
+
+
+def same_pad_conv2d(t, padding_type="reflect", kernel_size=3, stride=1, layer=None):
+    """
+    Perform SAME padding on tensor, given kernel size/stride of conv operator
+    assumes kernel/stride are equal in all dimensions.
+    Use before conv called.
+    Dilation not supported.
+    :param t image tensor input (B, C, H, W)
+    :param padding_type padding type constant | reflect | replicate | circular
+    constant is 0-pad.
+    :param kernel_size kernel size of conv
+    :param stride stride of conv
+    :param layer optionally, pass conv layer to automatically get kernel_size and stride
+    (overrides these)
+    """
+    if layer is not None:
+        if isinstance(layer, nn.Sequential):
+            layer = next(layer.children())
+        kernel_size = layer.kernel_size[0]
+        stride = layer.stride[0]
+    return F.pad(
+        t, calc_same_pad_conv2d(t.shape, kernel_size, stride), mode=padding_type
+    )
 
 
 # Geometry
@@ -195,7 +304,7 @@ def transform_rigid(xyz_hom: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
     Returns:
         xyz_trans: transformed points.
     """ 
-    return torch.einsum('...ij,...kj->...ki', T, xyz_hom)
+    return torch.einsum('...ij,...j->...i', T, xyz_hom)
        
 def get_normalized_cam_ray_directions(xy_pix:torch.Tensor,
                                         intrinsics:torch.Tensor) -> torch.Tensor:
@@ -203,12 +312,12 @@ def get_normalized_cam_ray_directions(xy_pix:torch.Tensor,
     return unnormalized_rays/torch.norm(unnormalized_rays, dim=-1).unsqueeze(-1)
 
 
-def get_world_rays(xy_pix: torch.Tensor, 
-                   intrinsics: torch.Tensor,
-                   cam2world: torch.Tensor,
+def get_world_rays(xy_pix: torch.Tensor, # (SB, n, 2)
+                   intrinsics: torch.Tensor, # (SB, 3, 3)
+                   cam2world: torch.Tensor, # (SB, n, 4, 4)
                    ) -> torch.Tensor:
     # Get camera origin of camera 1
-    cam_origin_world = cam2world[..., :3, -1]
+    cam_origin_world = cam2world[..., :3, -1]  # (SB, n, 3)
 
     # Get ray directions in cam coordinates
     ray_dirs_cam = get_normalized_cam_ray_directions(xy_pix, intrinsics)
@@ -220,8 +329,8 @@ def get_world_rays(xy_pix: torch.Tensor,
     rd_world_hom = transform_cam2world(rd_cam_hom, cam2world)
 
     # Tile the ray origins to have the same shape as the ray directions.
-    # Currently, ray origins have shape (SB, NV, 3), while ray directions have shape (SB, NV, num_rays, 3)
-    cam_origin_world = repeat(cam_origin_world, 'b nv ch -> b nv num_rays ch', num_rays=ray_dirs_cam.shape[2])
+    # Currently, ray origins have shape (SB, num_rays, 3), while ray directions have shape (SB, num_rays, 3)
+#     cam_origin_world = repeat(cam_origin_world, 'b ch -> b num_rays ch', num_rays=ray_dirs_cam.shape[1])
 
     # Return tuple of cam_origins, ray_world_directions
     return cam_origin_world, rd_world_hom[..., :3]
@@ -247,56 +356,86 @@ def get_opencv_pixel_coordinates(
     return xy_pix
 
 def depth_from_world(world_coords, cam2world):
-    points_hom = homogenize_points(world_coords)  # (batch, NV, num_samples, 4)
-    points_cam = transform_world2cam(points_hom,cam2world)  # (batch, NV, num_samples, 4)
-    return -points_cam[...,2]  # (batch, NV, num_samples, 1)
+    points_hom = homogenize_points(world_coords)  # (batch, num_samples, 4)
+    points_cam = transform_world2cam(points_hom,cam2world)  # (batch, num_samples, 4)
+    return -points_cam[...,2]  # (batch, num_samples, 1)
 
 # Loss functions
-def mse_loss(mlp_out, gt):
-    _, img, _ = mlp_out
-    return ((img - gt)**2).mean()
+def loss_fn(mlp_out, gt, loss_params, near = 0.5, far = 2.0):
+    img_coarse, img_fine, depth, _ = mlp_out
+    mse_loss = torch.nn.MSELoss()
+    loss = 0
+    if loss_params[0] != 'fine':
+        loss += mse_loss(img_coarse, gt)
+    if loss_params[0] != 'coarse':
+        loss += mse_loss(img_fine, gt)
+    if loss.isnan():
+        loss = 1e-6
+    if loss_params[1]:
+        penalty = torch.max(near-depth, torch.zeros_like(depth)) + torch.max(depth-far, torch.zeros_like(depth))
+        loss += torch.mean(penalty) * 10000
+    return loss
 
-def mse_loss_fine(mlp_out, gt):
-    img_coarse, img_fine, _ = mlp_out
-    return ((img_coarse - gt)**2).mean() + ((img_fine - gt)**2).mean()
+# def mse_loss(mlp_out, gt):
+#     _, img, _, _ = mlp_out
+#     loss = torch.nn.MSELoss()
+#     return loss(img, gt)
 
-def mse_regularization_loss(mlp_out, gt, near=0.5, far=2.0):
-    # add regularization loss
-    _, img, depth = mlp_out
-    penalty = (torch.min(depth-near, torch.zeros_like(depth)) ** 2) + (torch.max(depth-far, torch.zeros_like(depth)) ** 2)
-    return ((img - gt)**2).mean() + torch.mean(penalty) * 10000
+# def mse_loss_fine(mlp_out, gt):
+#     img_coarse, img_fine, _, _ = mlp_out
+#     loss = torch.nn.MSELoss()
+#     return loss(img_coarse,gt) + loss(img_fine,gt)
+
+# def mse_regularization_loss(mlp_out, gt, near=0.5, far=2.0):
+#     # add regularization loss
+#     _, img, depth, _ = mlp_out
+#     loss = torch.nn.MSELoss()
+#     penalty = torch.max(near-depth, torch.zeros_like(depth)) + torch.max(depth-far, torch.zeros_like(depth))
+#     return loss(img,gt) + torch.mean(penalty) * 10000
+
+# def mse_regularization_loss_fine(mlp_out, gt, near=0.5, far=2.0):
+#     # add regularization loss
+#     img_coarse, img_fine, depth, _ = mlp_out
+#     loss = torch.nn.MSELoss()
+#     penalty = torch.max(near-depth, torch.zeros_like(depth)) + torch.max(depth-far, torch.zeros_like(depth))
+#     mse_loss = loss(img_coarse,gt) + loss(img_fine,gt)
+#     if mse_loss.isnan():     # Prevent nan issue
+#         mse_loss = 1e-6
+#     return mse_loss + torch.mean(penalty) * 10000
 
 # Plotting functions
-def plot_output_ground_truth(vis_output, vis_gt, resolution, src_idx):
-    _, vis_img, vis_depth = vis_output
+def plot_output_ground_truth(vis_output, vis_gt, resolution):
+    _, vis_img, _, vis_depth = vis_output
 
     SB = vis_img.shape[0]
 
     _, axes = plt.subplots(SB, 3, figsize=(18, 6*SB), squeeze=False)
 
-    for sb in range(SB):
-        img = vis_img[sb,0]
-        depth = vis_depth[sb,0]
-        gt = vis_gt[sb,0]
+    img = vis_img[0]
+    depth = vis_depth[0]
+    gt = vis_gt[0]
 
-        axes[sb, 0].imshow(img.cpu().view(*resolution).detach().numpy())
-        if src_idx[sb,0] == 0:
-            title = "Trained MLP (same view as src)"
-        else:
-            title = "Trained MLP"
-        axes[sb, 0].set_title(title)
-        axes[sb, 1].imshow(gt.cpu().view(*resolution).detach().numpy())
-        axes[sb, 1].set_title("Ground Truth")
-        axes[sb, 2].imshow(depth.cpu().view(*resolution[:2]).detach().numpy(), cmap='Greys')
-        axes[sb, 2].set_title("Depth")
+    axes[0, 0].imshow(img.cpu().view(*resolution).detach().numpy())
+    axes[0, 0].set_title("Trained MLP")
+    axes[0, 1].imshow(gt.cpu().view(*resolution).detach().numpy())
+    axes[0, 1].set_title("Ground Truth")
+    axes[0, 2].imshow(depth.cpu().view(*resolution[:2]).detach().numpy(), cmap='Greys')
+    axes[0, 2].colorbar()
+    axes[0, 2].set_title("Depth")
         
-        for j in range(3):
-            axes[sb,j].set_axis_off()
+    for j in range(3):
+        axes[0,j].set_axis_off()
     plt.show()
 
-def get_metrics(mlp_out, gts): # rgb and gt are both 0 to 1 already
-    _, rgbs, _ = mlp_out
-    SB, NV, sl2, _ = rgbs.shape
+def get_metrics(mlp_out, gts, fine=True): # rgb and gt are both 0 to 1 already
+    
+    rgbs_coarse, rgbs_fine, _, _ = mlp_out
+    rgbs = rgbs_fine if fine else rgbs_coarse
+    if len(rgbs.shape ) == 4:
+        SB, NV, sl2, _ = rgbs.shape
+    else: 
+        SB, sl2, _ = rgbs.shape
+        NV = 1
     sl = int(np.sqrt(sl2))
 
     rgbs = rgbs.reshape(SB, NV, sl, sl, 3).detach().cpu().numpy()
@@ -310,8 +449,8 @@ def get_metrics(mlp_out, gts): # rgb and gt are both 0 to 1 already
         total_ssim = 0
 
         for nv in range(NV):
-            ssim = skimage.measure.structural_similarity(rgbs[sb,nv,...], gts[sb,nv,...], channel_axis=-1, data_range=1)
-            psnr = skimage.measure.peak_signal_noise_ratio(rgbs[sb,nv,...], gts[sb,nv,...], data_range=1)
+            ssim = skimage.metrics.structural_similarity(rgbs[sb,nv,...], gts[sb,nv,...], channel_axis=-1, data_range=1)
+            psnr = skimage.metrics.peak_signal_noise_ratio(rgbs[sb,nv,...], gts[sb,nv,...], data_range=1)
             total_ssim += ssim
             total_psnr += psnr
         
@@ -319,23 +458,6 @@ def get_metrics(mlp_out, gts): # rgb and gt are both 0 to 1 already
         ssims.append(total_ssim/NV)
 
     return np.mean(psnr), np.mean(ssim)
-
-def get_lpips(mlp_out, gts):
-    _, rgbs, _ = mlp_out
-    SB, NV, sl2, _ = rgbs.shape
-    sl = int(np.sqrt(sl2))
-
-    rgbs = rgbs.reshape(SB, NV, sl, sl, 3).permute(0,1,4,2,3).detach() * 2 - 1 # (SB, NV, 3, sl, sl)
-    gts = gts.reshape(SB, NV, sl, sl, 3).permute(0,1,4,2,3).detach() * 2 - 1 # (SB, NV, 3, sl, sl)
-    lpips_vgg = to_gpu(lpips.LPIPS(net="vgg"))
-
-    lpipss = []
-
-    for sb in range(SB):
-        lpipss.append(lpips_vgg(rgbs[sb],gts[sb]))
-    lpips_all = torch.cat(lpipss)
-
-    return lpips_all.mean().item().cpu().numpy()
 
 # utils for generating videos
 def get_R(x,y,z):

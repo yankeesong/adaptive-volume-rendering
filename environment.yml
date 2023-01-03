@@ -1,4 +1,4 @@
-name: adaptivevolumerendering
+name: AVR
 channels:
   - bottler
   - pytorch
@@ -311,4 +311,4 @@ dependencies:
     - urllib3==1.26.13
     - werkzeug==2.2.2
     - zipp==3.11.0
-prefix: /home/ysong/anaconda3/envs/adaptivevolumerendering
+prefix: /nobackup/users/yankeson/.conda/envs/AVR
