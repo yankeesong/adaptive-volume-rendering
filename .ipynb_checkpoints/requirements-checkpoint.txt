@@ -1,0 +1,20 @@
+torch
+torchvision
+pretrainedmodels
+pyhocon
+imageio
+opencv-python
+imageio-ffmpeg
+tensorboard
+dotmap
+numpy
+scipy
+scikit-image
+ipdb
+matplotlib
+tqdm
+lpips
+einops
+gdown
+h5py
+# importlib # already built-in in python3
